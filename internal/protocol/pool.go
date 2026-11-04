@@ -77,6 +77,8 @@ type WmpfSession struct {
 }
 
 type Pool struct {
+	// h5Send is an instance-local transport seam; nil uses send0RTTRaw.
+	h5Send func(context.Context, Target, pskEntry, []byte, []byte, time.Duration, string, bool) ([]byte, []byte, error)
 	events *eventlog.Logger
 	cfg    Config
 	db     *store.DB
@@ -142,6 +144,16 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	}
 	p.freshWindow.Store(int64(EffectiveFreshWindow(cfg.FreshSessionWindow)))
 	return p
+}
+
+// ProviderOf returns the credential provider marker of an account. Appstore
+// accounts store none; pcmgr and gameassist carry their channel name.
+func ProviderOf(acc *store.WechatAccount) string {
+	if acc == nil {
+		return ""
+	}
+	provider, _ := acc.Credentials["provider"].(string)
+	return provider
 }
 
 func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {

@@ -84,3 +84,17 @@
 继续移植后的复验：原差异域定向回归通过；`go test ./...`、`go build ./...`、`go vet ./...` 和 `git diff --check` 再次全部退出 0。覆盖请求代理路由隔离、OAuth/第三方授权离线模拟、scoped 扫码绑定/静态代理绑定、管理员批量迁移事务。全程没有真实账号、扫码同意、动态代理付费或支付请求。
 
 六个已有员工聊天均先读取核实；先派员工1并确认真实 commandExecution 输出，再展开其余独立任务。员工1、2、5、6在实际读取后因模型服务 `403 insufficient balance` 中断，没有把这些尝试计为交付。员工3交付在线区间、员工4交付 wxapkg 和质量审查；有效类型 default 的临时员工补齐受阻域，PM负责公共接线与集成。审查发现的编号错绑、错误重放、Windows ZIP 前缀均有离线回归修复。
+
+## 2026-11-05 上游同步
+
+同步前维护提交：`75d2fca545708c160afd0afec8eae5f63eab5818`；合并上游固定提交：`60921f77efb9949bc7cc2ef3ab94c7fcc71f6757`（包含 v0.2.75 后 fleet 修复），共同基线 `115455a7dc7b59e3cc752d399b92f22fc8299030`。
+
+保留维护接口和权限合同，并引入上游 H5/OAuth、GameAssist、动态 AppID denylist 和 fleet。`/wx/oauth` 默认自动交换 code；调用者可用 `return_url_only=true` 保留只生成授权链接行为，自动交换透传请求级 `proxyUrl`。旧维护 app.go 的 119 条显式唯一路径全部保留，合并后为 123 条（按 URL 大小写敏感统计，StringComparer.Ordinal）。
+
+交叉适配：fleet 候选逐账号执行 scoped Key、独占账号和浏览器 ownership 过滤；各成员仍独立执行代理授权与解析、会话 expected-account 检查。NoRetryError 在 fleet 层终止，不跨成员重放。named 兼容入口执行账号可见性与请求级代理检查。store 同时保留 fleet_primary_id 与 online 区间字段、迁移和扫描；过期清理保留 GameAssist 渠道标记。
+
+新增离线回归覆盖 scoped/独占成员隔离、浏览器 ownership、NoRetry 跨成员终止、proxyUrl 切换成员保留和 OAuth 自动交换代理透传。复验发现 fleet 的进程级 LRU 会串用不同 App 中相同账号 ID，已改为 App 实例独立记录，并增加跨实例隔离回归。
+
+H5 授权发送后的错误标记为 NoRetry；业务报文仅发送到一个 ShortLink 目标，禁止直连回退和跨目标重发。发送前的凭据获取策略保留。新增本地模拟覆盖响应丢失与畸形响应：各发送一次，不失效已有代理 session。此前未完成的进程级发送注入已移除，测试注入仅作用单个 Pool。
+
+最终修复后 `go test ./...`、`go build ./...`、`go vet ./...`、`git diff --check` 全部退出 0；`python -B -m unittest discover -s tests -p test_website_appid_scripts.py` 的 3 项离线测试通过。未进行真实账号、扫码、支付或部署验证。

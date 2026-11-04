@@ -151,6 +151,7 @@ type WechatAccount struct {
 	OnlineSince    *int64         `json:"online_since,omitempty"`
 	OnlineEndedAt  *int64         `json:"online_ended_at,omitempty"`
 	OnlineBasis    string         `json:"online_basis"`
+	FleetPrimaryID *int64         `json:"fleet_primary_id,omitempty"`
 	CreatedAt      int64          `json:"created_at"`
 	UpdatedAt      int64          `json:"updated_at"`
 	credentialJSON sql.NullString
@@ -158,6 +159,7 @@ type WechatAccount struct {
 
 type AccountPublic struct {
 	ScanProduct            string  `json:"scan_product"`
+	FleetPrimaryID         *int64  `json:"fleet_primary_id"`
 	ID                     int64   `json:"id"`
 	OpenID                 string  `json:"openid"`
 	UIN                    *int64  `json:"uin"`
@@ -241,6 +243,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateAccountLinks(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateAccountFleet(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -407,6 +413,30 @@ func onlineIntervalArgs(status, basis string, restart bool, now int64) []any {
 	return []any{status, restart, now, status, restart, basis, status, status, now}
 }
 
+func migrateAccountFleet(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(wechat_accounts)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "fleet_primary_id" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, "ALTER TABLE wechat_accounts ADD COLUMN fleet_primary_id INTEGER")
+	return err
+}
+
 func migrateAccountProxySettings(ctx context.Context, db *sql.DB) error {
 	columns := []struct {
 		name       string
@@ -569,6 +599,39 @@ func (db *DB) ResolveAccount(ctx context.Context, ref string) (*WechatAccount, e
 		return db.GetAccount(ctx, n)
 	}
 	return db.GetAccountByOpenID(ctx, ref)
+}
+
+// SetAccountFleet binds an account into the fleet rooted at primaryID.
+// primaryID 0 unbinds. A primary anchors its own fleet by self-binding:
+// without the self-reference, requests aimed at the primary would never
+// dispatch to the members.
+func (db *DB) SetAccountFleet(ctx context.Context, accountID, primaryID int64) error {
+	var target *int64
+	if primaryID > 0 {
+		target = &primaryID
+	}
+	_, err := db.sql.ExecContext(ctx, "UPDATE wechat_accounts SET fleet_primary_id=?, updated_at=? WHERE id=?",
+		target, time.Now().Unix(), accountID)
+	return err
+}
+
+// FleetMembers returns the fleet rooted at primaryID (the primary itself
+// plus every account bound to it), oldest id first for stable ordering.
+func (db *DB) FleetMembers(ctx context.Context, primaryID int64) ([]*WechatAccount, error) {
+	rows, err := db.sql.QueryContext(ctx, selectAccountSQL+" WHERE id=? OR fleet_primary_id=? ORDER BY id", primaryID, primaryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*WechatAccount, 0, 3)
+	for rows.Next() {
+		acc, err := scanAccountRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, acc)
+	}
+	return out, rows.Err()
 }
 
 func (db *DB) ListAccounts(ctx context.Context) ([]*WechatAccount, error) {
@@ -840,13 +903,17 @@ func (db *DB) SetAccountCredentialStatus(ctx context.Context, id int64, loginBuf
 // read from SQLite: reserializing an imported record may change whitespace/order.
 func (db *DB) ApplyCredentialRefresh(ctx context.Context, expected *WechatAccount, loginBuffer string, credentials map[string]any, status string) (bool, error) {
 	if status == "expired" {
-		loginBuffer, credentials = "", nil
+		loginBuffer, credentials = "", keepChannelMarkers(expected.Credentials)
 	}
 	if status == StatusSessionOnly {
-		// Keep the scan timestamp as audit metadata, never rejected tokens.
-		credentials = nil
+		// Keep the scan timestamp as audit metadata and the channel marker,
+		// never rejected tokens.
+		credentials = keepChannelMarkers(expected.Credentials)
 		if observed := int64Credential(expected.Credentials, "refresh_token_observed_at"); observed > 0 {
-			credentials = map[string]any{"refresh_token_observed_at": observed}
+			if credentials == nil {
+				credentials = map[string]any{}
+			}
+			credentials["refresh_token_observed_at"] = observed
 		}
 		loginBuffer = ""
 	}
@@ -882,9 +949,23 @@ WHERE id=? AND openid=? AND credentials IS ? AND login_buffer=? AND status IS ?`
 func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) error {
 	now := time.Now().Unix()
 	if status == "expired" {
-		_, err := db.sql.ExecContext(ctx,
-			"UPDATE wechat_accounts SET "+accountOnlineIntervalSQL+"login_buffer='', credentials=NULL, status=?, last_checked_at=?, updated_at=? WHERE id=?",
-			append(onlineIntervalArgs(status, "observed", false, now), status, now, now, id)...,
+		// Expiry wipes the credentials but keeps the channel marker, which for a
+		// GameAssist account is the only thing that says what it is.
+		var raw sql.NullString
+		if err := db.sql.QueryRowContext(ctx, "SELECT credentials FROM wechat_accounts WHERE id=?", id).Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var current map[string]any
+		if raw.Valid {
+			_ = json.Unmarshal([]byte(raw.String), &current)
+		}
+		kept, err := marshalNullable(keepChannelMarkers(current))
+		if err != nil {
+			return err
+		}
+		_, err = db.sql.ExecContext(ctx,
+			"UPDATE wechat_accounts SET "+accountOnlineIntervalSQL+"login_buffer='', credentials=?, status=?, last_checked_at=?, updated_at=? WHERE id=?",
+			append(onlineIntervalArgs(status, "observed", false, now), kept, status, now, now, id)...,
 		)
 		return err
 	}
@@ -1023,8 +1104,15 @@ func (db *DB) GetFeatureByName(ctx context.Context, name string) (*Feature, erro
 
 func (a *WechatAccount) Public() AccountPublic {
 	product := "appstore"
-	if strings.HasPrefix(a.OpenID, "pcmgr:") {
+	switch {
+	case strings.HasPrefix(a.OpenID, "pcmgr:"):
 		product = "pcmgr"
+	case stringCredential(a.Credentials, "provider") == "pcmgr":
+		product = "pcmgr"
+	case stringCredential(a.Credentials, "provider") == "gameassist":
+		// GameAssist accounts keep their real WeChat openId, so the provider
+		// marker is the only channel signal.
+		product = "gameassist"
 	}
 	var refreshTokenObservedAt *int64
 	rescanRecommended := a.SessionOnly()
@@ -1058,6 +1146,7 @@ func (a *WechatAccount) Public() AccountPublic {
 	}
 	return AccountPublic{
 		ScanProduct:            product,
+		FleetPrimaryID:         a.FleetPrimaryID,
 		ID:                     a.ID,
 		OpenID:                 a.OpenID,
 		UIN:                    a.UIN,
@@ -1084,6 +1173,21 @@ func stringCredential(values map[string]any, key string) string {
 	return value
 }
 
+// keepChannelMarkers returns what survives when an account's credentials are
+// wiped because the authorization was rejected: the marker that says which
+// channel the account belongs to, and nothing secret. A GameAssist account keeps
+// its real WeChat openId, so its provider marker is the only thing telling it
+// apart from an App Store account; losing it relabelled the account as YYB in
+// the console, in the events and in the offline notice. PCMgr accounts are told
+// apart by their "pcmgr:" openId prefix and App Store accounts carry no marker,
+// so only GameAssist needs this.
+func keepChannelMarkers(credentials map[string]any) map[string]any {
+	if stringCredential(credentials, "provider") == "gameassist" {
+		return map[string]any{"provider": "gameassist"}
+	}
+	return nil
+}
+
 func int64Credential(values map[string]any, key string) int64 {
 	switch value := values[key].(type) {
 	case int64:
@@ -1100,7 +1204,7 @@ func int64Credential(values map[string]any, key string) int64 {
 	}
 }
 
-const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, remark, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at, online_since, online_ended_at, online_basis FROM wechat_accounts`
+const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, remark, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at, online_since, online_ended_at, online_basis, fleet_primary_id FROM wechat_accounts`
 
 type accountScanner interface {
 	Scan(dest ...any) error
@@ -1116,16 +1220,16 @@ func (db *DB) scanAccount(row accountScanner) (*WechatAccount, error) {
 
 func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	var (
-		a                                            WechatAccount
-		uin, lastChecked, onlineSince, onlineEndedAt sql.NullInt64
-		alias, nickname, remark, avatar              sql.NullString
-		userJSON, credJSON                           sql.NullString
-		status                                       sql.NullString
+		a                                                          WechatAccount
+		uin, lastChecked, onlineSince, onlineEndedAt, fleetPrimary sql.NullInt64
+		alias, nickname, remark, avatar                            sql.NullString
+		userJSON, credJSON                                         sql.NullString
+		status                                                     sql.NullString
 	)
 	err := row.Scan(
 		&a.ID, &a.OpenID, &uin, &alias, &nickname, &remark, &avatar, &userJSON,
 		&a.LoginBuffer, &credJSON, &status, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
-		&onlineSince, &onlineEndedAt, &a.OnlineBasis,
+		&onlineSince, &onlineEndedAt, &a.OnlineBasis, &fleetPrimary,
 	)
 	if err != nil {
 		return nil, err
@@ -1146,6 +1250,9 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	}
 	if lastChecked.Valid {
 		a.LastCheckedAt = &lastChecked.Int64
+	}
+	if fleetPrimary.Valid {
+		a.FleetPrimaryID = &fleetPrimary.Int64
 	}
 	if userJSON.Valid && userJSON.String != "" {
 		_ = json.Unmarshal([]byte(userJSON.String), &a.UserInfo)

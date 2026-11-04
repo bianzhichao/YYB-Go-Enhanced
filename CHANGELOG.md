@@ -2,6 +2,66 @@
 
 本项目按实际提交时间记录主要功能变化，便于部署后确认版本内容。
 
+## v0.2.77 - 2026-11-05
+
+- **编队转移补齐熔断成员（生产实测发现）：** v0.2.76 的轮转在生产验证时暴露一个缺口——轮到的成员如果 (账号, AppID) 熔断还在生效，请求直接返回 429 而不是转移给下一成员（熔断器按成员独立，别的成员完全能答）。现在 `circuitOpenError` 加入编队转移清单，熔断成员自动跳过。另外实测确认三成员编队轮转已生效：同一 ref 连续取码由应用宝/电脑管家/手游助手成员轮流出码（`result.fleet_member` 标记实际服务的成员）。
+
+## v0.2.76 - 2026-11-05
+
+- **新增账号编队（Fleet）：同一微信多渠道账号合并调度，并发分摊 + 渠道故障转移，脚本零改动。** 背景：多账号并发取码时，单渠道身份会吸收整个突发（-14 → 重建 → 上游"整体拒绝" → 刷新 40030 → 掉线，详见取码量对照实验）。编队把同一微信在应用宝/电脑管家/手游助手的授权绑成一组（unionid 校验防绑错），`/wx/*` 调用按成员"最近最少使用"轮转分发——每个成员保留自己独立的会话、3 秒限速、登录预算与熔断，单身份上游压力按成员数摊薄；成员被上游推回（-14 类应用拒绝、凭据签发拒绝、预算耗尽、仅会话不可用、账号过期）时**透明转移到下一成员**，业务裁决类错误（如 h5 的 10003 回调域名不一致）不转移（换成员结果相同）。接口：`POST /api/fleet {ref, primary_ref, force?}` 绑定、`DELETE /api/fleet {ref}` 解绑、`GET /api/fleet?ref=` 查看；`force=true` 跳过 unionid 校验（unionid 缺失时默认放行并提示自行确认）。转移动作记入事件（`fleet.failover`）。已知边界：编队 LRU 状态存内存，重启后从 id 顺序重新开始；同微信三路并发登录是否被上游关联需生产观察。
+
+## v0.2.75 - 2026-11-05
+
+- **`/wx/oauth` 默认自动换取网页授权 code（H5 脚本零改动迁移）：** 场外"代理登录完整版"（基于 v0.2.2 改造）的 `/wx/oauth` 约定——POST `appid + redirect_uri` 直接返回真实 code——已被 H5 脚本实战验证不掉线（公众号 code 走网页授权通道，不再把公众号 AppID 塞进 `/wx/code` 烧授权）。本版本把该约定接入官方主线：默认走 `/wx/h5code` 的完整机器（命令 1254、appid 黑名单、限速、熔断、登录预算全部生效），响应映射为场外形状（`code/scope/state/url/mode:"authorization_code"/account`）；`openid` 可作 ref 别名；`return_url_only=true` 保留旧的"只生成授权链接"行为。业务拒绝与传输失败按原状态码和报文透传。注意：默认行为从"返回链接"变为"消耗一次会话换 code"——只要链接不要 code 的调用方需显式带 `return_url_only=true`。
+
+## v0.2.74 - 2026-11-04
+
+- **修复手游助手账号被显示成 YYB、还被判失效（生产 15 号，11-04）：** 两个原因。① 刷新走错了线：gameassist 凭据一直走应用宝的 `pc_yyb` 刷新路由，第一次刷新（旧 access token 还没过期）能"成功"，之后真正需要刷新时上游答复 `invalid refresh_token`（40030），账号被降为仅会话——还能凭缓存的会话取码，所以看起来"能调用却被判失效"。官方手游助手客户端自己走的是 `/v3/syzs_refresh_token` 和 `/v3/syzs_check_login`，业务线 `syzslogin`（本机官方客户端日志里它每 2 小时刷新一次，连续 6 次成功；用假令牌对真实网关探过，只有这条业务线能到达处理逻辑）。现在 gameassist 的刷新和 check-login 改走这条线。② 降级时抹掉了渠道标记：gameassist 账号保留真实 openId，渠道只认凭据里的 `provider`，账号被限制为仅会话或被置为失效时凭据整体清空，之后它在控制台、事件和离线通知里全成了 YYB。现在清空凭据时只保留这个标记，不保留任何令牌；应用宝和电脑管家账号不受影响。已经掉成仅会话的账号（生产 15 号）凭据已经清掉，需要重新扫码。
+- **验证到哪一步：** 新路径用本机实验实例和一个真实的手游助手扫码账号对着真实网关测过：三次刷新都成功（保活两次、手工一次），应答是 `code:0`、`RC_SUCCESS`，`userInfo` 里 access 和 refresh 令牌与发出去的相同，只带 `expiresIn`（字符串 `"7200"`，`openId` 为空），与官方客户端日志里“令牌不变、只更新到期时间”一致；用刷新后的凭据取登录票据和 `syzs_check_login` 都成功。**还没有验证的是生产上失败的那一步：** 令牌真正过期之后再刷新是否成功（实验账号 19:36 扫码，过期点在 21:36 之后，另有定时检查），以及同一个微信同时在官方客户端和服务里登录是否互相顶掉。详见[手游助手渠道接入复核](docs/gameassist-protocol-20261104.md)。
+- **账号被上游拒绝时，日志里记下它刚刚做了什么：** `account.expired` 和 `account.refresh_failed` 事件新增 `recent` 字段，列出这个账号最近 3 分钟内（最多 12 条）的取码、取号、转发请求：AppID、请求类型、结果（成功、失败、恢复开始、熔断延后等）、距离事件多少秒，以及失败时的上游拒绝码（如 `-14`）。只含标识符，不含请求内容、凭据或 code，只在内存里记着，重启后清空。目的是下一次有账号无缘无故掉线，不用再靠猜：11-04 00:21–00:28 账号 1 在连续成功 17 个 code 后被拒，现在掉线事件自己带着掉线前的请求序列，不必事后到运行日志里去拼。反馈掉线问题时请把这一条事件的详情贴出来。这一项没有改变任何请求行为。
+- **项目自带的两个脚本默认停用：** `腾讯电脑管家_code版.py`（`wx5cd60c5d4817a188`）和 `京东CK采集_code版.py`（`wx2f5d8f9715c59d10`）用网站应用 AppID 取 code，对这类 AppID 取一次 code 就见过授权被上游拒绝（生产 2 个账号、本机对照 3 次）。服务端从 v0.2.63 起默认拒绝这两个 AppID，但脚本和服务端是分开更新的，旧版本服务上仍会打死账号，所以脚本现在默认不运行，打印原因后退出，不发任何请求。确认要运行需设置 `YYB_ALLOW_WEBSITE_APPID=1`，并在服务端放行（`YYB_CODE_ALLOW_APPIDS`）。已经把这两个任务加进青龙的用户，更新脚本后它们会静默结束。公众号网页授权的 code 另有专用接口 `/wx/h5code`（v0.2.66，见 [H5 OAuth code](docs/h5-oauth-code.md)）；这两个脚本改走它能否拿到可用的登录态没有验证，所以这里只是停用，没有改写。
+- 服务端的取码、续期和保护行为这一版都没有改（v0.2.66–v0.2.73 的变化原样保留），授权被上游拒绝的根因也没有找到：实验室几轮对照没有给出结论，见[取码量对照实验](docs/dense-batch-lab-20261103.md)。
+
+## v0.2.73 - 2026-11-04
+
+- **面板前端补齐 gameassist 渠道（后端早已就绪，此前的扫码入口只有 YYB/PCMgr 两个选项）：** 扫码页、一次性授权链接页、账号链接弹窗、扫码设置（个人/系统默认）的渠道下拉全部加入"GameAssist"；面板六处二元硬编码（账号列表渠道徽标、取码测试标签、合并/链接列表等）改走三渠道 `scanChannelName`/`scanChannelBadge` 助手并新增手柄图标，gameassist 账号不再被显示成 YYB。共享脚本移入 `<head>` 保证渲染前可用，静态资源缓存版本升至 v=049。
+
+## v0.2.72 - 2026-11-04
+
+- **修复 gameassist 换票提取顺序（实机定位，v0.2.71 流程缺陷）：** 逐跳指纹显示 `syzs_oauth` 302 已正确种下全部凭据 cookie（`openid/accesstoken/refreshtoken/logintype/scope/expires_in/appid/syzs_prefix`）再跳官方 `login_result.html`，但 HTML 正文令 JSON 解析先报错短路，cookie 提取代码根本没执行到。现在三种来源（JSON 信封 / jar / 逐跳 Set-Cookie / HTML 字面量）统一先尝试、全部落空才报诊断指纹；cookie 提取补齐 `scope`（容忍 `%2C` 转义）与 `expires_in`（无信号时回退约 30 天窗口，避免账号生而过期）。
+
+## v0.2.71 - 2026-11-04
+
+- **gameassist 换票逐跳捕获 cookie（实机定位）：** 形态指纹显示换票 302 链正常终结在官方 `login_result.html`（len=2322 与该静态页完全一致），但凭据 cookie 在中间跳的 Set-Cookie 上、会话 jar 跨域没收住。ExchangeCode 现在用逐跳记录传输层抓取**每一跳**的 Set-Cookie 并按名提取凭据（不再依赖 jar 的跨域语义），同时回调请求补上官方浏览器形态的 Referer/Chrome UA；失败指纹改为整条重定向链（每跳状态+脱敏 URL+Set-Cookie 名单）。
+
+## v0.2.70 - 2026-11-04
+
+- **gameassist 换票第二跳适配（实机推进）：** 数字 state 修复后，`syzs_oauth` 对有效 code 不再返回 JSON 信封，而是官方流程中的 HTML 中转跳（凭据经 .qq.com cookie 交给 `login_result.html`）。ExchangeCode 现在按三种形态收尾：JSON 信封 / 会话 jar 里的 cookie / **HTML 中转页里的 `document.cookie`/`setCookie` 字面量**；解析失败时报错只带形态指纹（HTTP 状态、Content-Type、长度、Set-Cookie 名单、脱敏后的最终 URL），绝不带正文，防止凭据进日志。
+
+## v0.2.69 - 2026-11-04
+
+- **修复 gameassist 扫码换票被拒（实机定位）：state 必须是数字。** 首次生产扫码授权成功后 `syzs_oauth` 返回 `-109 RC_PARAMS_INVALID`；用假 code 做参数矩阵探测，`state=web` 稳定复现 -109，而 `state=49.57735723381141`（官方客户端 JS `state=100*Math.random()` 的形状）立即推进到 `-107 RC_NO_AUTH_ERR`（与 pcyyb_oauth 假 code 的"码无效"层一致）。现在扫码会话生成官方形状的随机浮点 state 并原样带到回调换取；非数字 state 在本地直接拒绝。
+- **扫码确认吸收电脑管家票据的瞬态拒绝：** 首次生产扫码接入 pcmgr 账号时，刚换到的 loginkey 立刻调原生 20138 得 `code=6`，约一分钟后手动重试同一凭据成功——是签发侧到原生网关的传播延迟。现在确认阶段的 8 秒重试窗口把 `pcmgr.BufferRejectedError` 一并纳入（重试不轮换 key、不重放 OAuth），扫码确认不再需要手动补一次。
+
+## v0.2.68 - 2026-11-04
+
+- **新增腾讯手游助手（GameAssist）扫码渠道 `gameassist`：** 第三条客户端凭据链。逆向实证（详见[手游助手渠道接入复核](docs/gameassist-protocol-20261104.md)）：手游助手 6.10 是应用宝 Androws 源码树改版，WMPF host_appid 同为 `wxd44977328b36e647`、ilink 取码栈同构，差异只在凭据签发——OAuth appid `wxef99873dbfab493c`、回调 `yybadaccess.3g.qq.com/syzslogin/syzs_oauth` 换取 `{openId, accessToken "1_…", refreshToken}`（camelCase 信封，同网关同结构已由探测证实），之后复用与 appstore 完全相同的 `pcyyb_get_wx_login_buffer_auth` 换 login_buffer。新包 `internal/gameassist` 兼容 camelCase/snake_case/cookie 三种签发形态并校验 `snsapi_runtime_pcsdk` scope；`product=gameassist` 贯通扫码、面板、OpenAPI 枚举、事件渠道、离线通知与账号渠道展示。刷新走默认 `pc_yyb` 主路由（`-109` 自动转 check-login），初扫约 30 天窗口、首次刷新后收敛为网关 `expires_in`。
+- **渠道大一统补齐（脚本零改动）：** 青龙脚本本就渠道无关（`ref@appserver → /wx/code`，渠道由服务端按账号凭据自动路由；生产 13 个账号全是 appstore、pcmgr/gameassist 尚未在生产接入）。本次把审计出的边缘差异全部抹平：`/integration/accounts` 每条增加 `scan_product`（脚本可按渠道统计分流）；`protocol.login_limited` 限流事件按账号真实渠道打标（此前硬编码 `yyb`，新增 `eventlog.ChannelFor`）；`/wx/getuserinfo` 补齐与 `/wx/code` 一致的过期拦截（unknown 状态且缓存已过期的账号不再先打上游再 502）；gameassist 凭据在 pc_yyb 用户信息端点被拒时降级返回本地资料（与 pcmgr 行为对齐，appstore 保持原样）；`unsupported credential provider` 错误带出实际 provider 值。主链路 `/wx/code`、`/wx/h5code`、手机号、operateWxData、cloud、encryptkey 三渠道行为在代码层完全一致（2026-11-04 审计：身份取自 buffer 字段 3，gameassist 必然落入 yyb 分支，pcmgr 票据有字段 3 强校验反向保护）。
+- **已知边界（如实告知）：** `syzs_oauth` 成功响应形态与 `pcyyb_get_wx_login_buffer_auth` 对 syzs 票据的接受度依赖实机扫码验证——静态证据支持可行，若被拒按文档后备路径（GameAssistant.exe 的 syzs Ual 头族 / launch_param 路线）迭代；`/wx/h5code` 等公众号类接口对 pcmgr/gameassist 会话尚未真机回归。
+
+## v0.2.67 - 2026-11-04
+
+- **修复 `YYB_CODE_ALLOW_APPIDS` 未覆盖动态黑名单的缺陷：** v0.2.66 里放行名单只作用于内置黑名单，动态学习的禁用不受它影响。现在启动时会直接从持久化的动态名单里移除被放行的 AppID（并清除其计数），文档承诺的"放行优先级最高"生效。
+- **动态自学习黑名单改为跨账号确认（v0.2.66 引入、v0.2.67 修正）：** 11-04 00:21–00:28，一个遍历全部账号的脚本让账号 1 在 80 秒内连续成功 17 个 code 后进入上游整体拒绝模式，随后每个 AppID 的取码都"无 code"，v0.2.66 的"1 次即禁"把 62 个 AppID 全部禁用，其中 11 个是几分钟前还在其他账号上成功取码的健康小程序（事件日志可查：`wx141bfb9b73c970a9` 在账号 1 失败的同一时间窗里在账号 9 上成功 2 次）。现在同一 AppID 需要 **2 个不同账号**都拿不到 code（或累计 4 次，覆盖单账号部署）才禁用，任一账号成功即清零计数；`YYB_CODE_DYNAMIC_DENY_THRESHOLD` 的含义相应改为"几个不同账号"，默认 `2`。真死的 AppID 在所有账号上都拿不到 code，仍会被禁。已有部署升级后，此前误禁的 AppID 可用 `POST /api/appid-deny`（不带参数清空全部）或放行名单恢复。
+- **同型的账号死亡仍未解决：** 账号 1 在上述窗口后被按需恢复以 `refresh_token -109 + check_login -109/42007` 拒绝，转为 `session_only`（与 11-03 00:44 同型，该账号当晚重扫后复活）。"长时间持续取码后整账号被拒"的触发阈值在上游，3 秒限速挡不住；脚本侧应摊开同一账号的取码时间。详见[公众号网页授权 code 与动态 AppID 防护](docs/h5-oauth-code.md)。
+
+## v0.2.66 - 2026-11-04
+
+- **新增公众号网页授权 code 接口 `POST /wx/h5code`（兼容入口 `/wxapp/getH5Code`）：** 用账号自己的 YYB 会话走命令 1254（`/cgi-bin/mmbiz-bin/oauth_authorize`）自动完成公众号网页授权，返回回跳里的 code。请求体带 `ref`、`app_id` 和 `payload.redirect_uri`（必填）、`scope`（默认 `snsapi_base`）、`state`（缺省自动生成）；响应 `result` 含 `code`、`state`、`scope`、`redirect_uri`、`mode:"h5_oauth_auto"`。依据：10-31 的隔离对照在同一份早期会话上真机验证过这条链路（业务 `ret=0`、32 位 code、回调与 state 严格匹配），另见 issue #75/#85/#87 的诉求。成功标准收紧：回复必须带显式业务状态 0，Location 的 scheme/host/path 必须与 `redirect_uri` 一致、`code`/`state` 各一次且 `state` 匹配；服务端不访问业务回调。
+- **为什么需要它：** H5/公众号脚本此前只能把公众号 AppID 塞进 `getCode`，上游按小程序流程返回"没有 code"，随后账号 OAuth 层被风控拒绝（11-03 的一对一对照与 issue #133 都是这一类），v0.2.63 只拦了两个已知网站应用 AppID。H5 脚本改走 `/wx/h5code` 后不再触发这条风控。
+- **H5 请求失败不恢复：** 业务拒绝与传输失败都原样返回给脚本，不强制刷新、不作废会话、不重放授权请求（确认授权会签发一次性 code，重放有副作用）；账号健康完全交给后台保活。限速、登录预算、熔断照常生效。
+- **动态自学习 AppID 黑名单：** 取码请求真正到达上游且重试后仍拿不到 code（网站应用/公众号特征）时，该 AppID 自动禁用并持久化（默认 1 次即禁用，`YYB_CODE_DYNAMIC_DENY_THRESHOLD` 可调），之后所有账号的这类请求本地 `403`，不再触达上游；未知 H5 AppID 至多损失一次请求。健康小程序的偶发失败在重试成功或后续成功时清零计数。`GET /api/appid-deny` 查看、`POST /api/appid-deny?app_id=wx…` 清除（面板登录态）；`YYB_CODE_ALLOW_APPIDS` 优先级最高，`YYB_CODE_DYNAMIC_DENY=0` 关闭学习。代价：上游抖动让健康小程序连续拿不到 code 时会被误禁，放行或清除即可恢复——默认值偏保守。详见[公众号网页授权 code 与动态 AppID 防护](docs/h5-oauth-code.md)。
+
 ## v0.2.65 - 2026-11-03
 
 - **新增 `YYB_FRESH_SESSION_WINDOW`：可缩短或关闭“刚成功后的 `-14` 不重新登录”保护（默认仍是 `2m`，行为不变）：** 这个保护自 v0.2.60 起写死为 2 分钟，没有开关。11-03 的实验室对照里，同一账号在 20 秒内连发 40 个不同小程序 AppID 的取码（失败后脚本式重试）：默认保护只拿到 1 个 code，118 次尝试里 108 次是本机直接回的 `429`（会话熔断 82、3 秒限速 26），9 次 `-14` 被保护放弃恢复；同一份代码把保护关掉后 40 个全部拿到（其中 39 次是先 `-14`、重新登录后成功，44 秒内完成），v0.2.35 也是 40 个；三个授权在 30 秒和 10 分钟后的刷新探测里都还活着。原因是这些账号的会话看起来用一次就要重新登录才能换下一个 AppID：保护把本来能修好的 `-14` 当成 AppID 自己被拒，随后会话熔断把三个不同 AppID 的 `-14` 当成整个会话被拒，暂停 15 分钟。

@@ -38,6 +38,7 @@ var catalog = map[string]definition{
 	"protocol.circuit_deferred":  {"protocol", "debug", "请求处于熔断期，未发往上游"},
 	"protocol.paced":             {"protocol", "info", "取码限速：部分请求已排队或被暂缓"},
 	"protocol.appid_denied":      {"protocol", "warn", "取码已拒绝：网站应用 AppID，未发往上游"},
+	"fleet.failover":             {"protocol", "info", "编队转移：该成员上游推回，请求交给下一成员"},
 	"protocol.login_limited":     {"protocol", "warn", "重新登录次数已达上限，部分请求未再恢复会话"},
 	"protocol.ticket_requested":  {"protocol", "info", "请求新的登录票据"},
 	"protocol.recovered":         {"protocol", "info", "新会话取码验证通过"},
@@ -66,6 +67,7 @@ const (
 	OpGetCode        = "get_code"
 	OpGetPhoneNumber = "get_phone_number"
 	OpOperateWXData  = "operate_wx_data"
+	OpH5Code         = "h5_code"
 )
 
 type Fields struct {
@@ -84,6 +86,9 @@ type Fields struct {
 	// Waited and Refused summarise a burst that pacing queued or turned away.
 	Waited  uint64 `json:"waited,omitempty"`
 	Refused uint64 `json:"refused,omitempty"`
+	// Recent is what the account had just asked for; it is attached to the
+	// events that report a death (account.expired, account.refresh_failed).
+	Recent []RecentRequest `json:"recent,omitempty"`
 }
 
 // Refresh sources outside the background keepalive loop, which reports its own
@@ -106,15 +111,25 @@ func (f Fields) WithTarget(appID, operation, api string) Fields {
 	return f
 }
 
+// ChannelFor maps an account credential provider to its log channel. The
+// empty provider is the default YYB (appstore) channel.
+func ChannelFor(provider string) string {
+	switch provider {
+	case "pcmgr":
+		return "pcmgr"
+	case "gameassist":
+		return "gameassist"
+	default:
+		return "yyb"
+	}
+}
+
 func ForAccount(acc *store.WechatAccount) Fields {
 	if acc == nil {
 		return Fields{}
 	}
-	channel := "yyb"
-	if acc.Credentials["provider"] == "pcmgr" {
-		channel = "pcmgr"
-	}
-	return Fields{AccountID: acc.ID, Channel: channel}
+	provider, _ := acc.Credentials["provider"].(string)
+	return Fields{AccountID: acc.ID, Channel: ChannelFor(provider)}
 }
 
 // Routes are router templates, never the requested URL or account-link token.
@@ -133,7 +148,7 @@ func safeSource(source string) bool {
 
 func safeOperation(op string) bool {
 	switch op {
-	case OpGetCode, OpGetPhoneNumber, OpOperateWXData:
+	case OpGetCode, OpGetPhoneNumber, OpOperateWXData, OpH5Code:
 		return true
 	}
 	return false
@@ -154,13 +169,14 @@ type Logger struct {
 	queue   chan store.SystemLog
 	done    chan struct{}
 	dropped atomic.Uint64
+	recent  *recentBook
 }
 
 func New(db *store.DB) (*Logger, error) {
 	if err := db.InitSystemLogs(context.Background()); err != nil {
 		return nil, err
 	}
-	l := &Logger{db: db, queue: make(chan store.SystemLog, 256), done: make(chan struct{})}
+	l := &Logger{db: db, queue: make(chan store.SystemLog, 256), done: make(chan struct{}), recent: newRecentBook()}
 	go l.run()
 	return l, nil
 }
@@ -176,7 +192,7 @@ func (l *Logger) Emit(event string, f Fields) {
 	if f.AccountID < 0 {
 		f.AccountID = 0
 	}
-	if f.Channel != "yyb" && f.Channel != "pcmgr" {
+	if f.Channel != "yyb" && f.Channel != "pcmgr" && f.Channel != "gameassist" {
 		f.Channel = ""
 	}
 	if !safeRoute.MatchString(f.Route) {
@@ -206,6 +222,8 @@ func (l *Logger) Emit(event string, f Fields) {
 		}
 	}
 	f.Rejections = clean
+	l.recent.observe(event, f)
+	f.Recent = cleanRecent(f.Recent)
 	raw, _ := json.Marshal(f)
 	item := store.SystemLog{CreatedAt: time.Now().UnixMilli(), Level: d.level, Category: d.category, Event: event, Message: d.message, AccountID: f.AccountID, Channel: f.Channel, Details: raw}
 	l.mu.RLock()
