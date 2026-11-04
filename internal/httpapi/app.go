@@ -388,6 +388,7 @@ func (a *App) Handler() http.Handler {
 	protocolRoutes.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
 	protocolRoutes.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	protocolRoutes.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
+	protocolRoutes.Any("/wxapp/getHostSign", gin.WrapF(a.handleGetHostSign))
 	protocolRoutes.Any("/wx/code", gin.WrapF(a.handleWXCodeAlias))
 	protocolRoutes.Any("/wx/getuserinfo", gin.WrapF(a.handleWXGetUserInfo))
 	protocolRoutes.Any("/wx/encryptkey", gin.WrapF(a.handleWXEncryptKey))

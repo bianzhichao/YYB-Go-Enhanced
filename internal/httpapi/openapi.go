@@ -479,6 +479,17 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			"/wxapp/getHostSign": map[string]any{
+				"post": openAPIOperation(
+					[]string{"wxapp"},
+					"获取 HostSign（verifyplugin）",
+					nil,
+					jsonRequestBody(refSchema("WxappRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("getHostSign 调用结果。", refSchema("WxappResponse")),
+					}),
+				),
+			},
 			"/wxapp/operateWxData": map[string]any{
 				"post": openAPIOperation(
 					[]string{"wxapp"},
