@@ -48,6 +48,12 @@ func (a *App) handleUserRollCall(w http.ResponseWriter, r *http.Request, a8call 
 		writeError(w, 400, "invalid JSON")
 		return
 	}
+	proxyCtx, proxyErr := withRequestProxy(r.Context(), body.ProxyURL)
+	if proxyErr != nil {
+		writeError(w, 400, proxyErr.Error())
+		return
+	}
+	r = r.WithContext(proxyCtx)
 	target, biz, _, err := protocol.NormalizeA8KeyPayload(body.Payload)
 	if err != nil {
 		writeError(w, 400, err.Error())
@@ -68,6 +74,12 @@ func (a *App) handleUserRollCall(w http.ResponseWriter, r *http.Request, a8call 
 	if !ok {
 		return
 	}
+	plannedCtx, _, _, err := a.wxappProxyPlan(r.Context(), acc.ID)
+	if err != nil {
+		writeError(w, 403, "request proxy is not allowed")
+		return
+	}
+	r = r.WithContext(plannedCtx)
 	payload := make(map[string]any, len(body.Payload)+2)
 	for key, value := range body.Payload {
 		payload[key] = value

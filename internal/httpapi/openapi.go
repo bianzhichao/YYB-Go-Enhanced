@@ -597,6 +597,7 @@ func newOpenAPISpec() map[string]any {
 					"remark": map[string]any{"type": "string", "maxLength": 80},
 				}),
 				"ProxySpec": objectSchema(nil, map[string]any{
+					"owner_key_id":          nullableInt64Schema(),
 					"protocol_proxy_mode":   map[string]any{"type": "string", "enum": []string{"account", "direct"}, "description": "新账号小程序调用出口，默认跟随账号连接模式；已有账号重扫保留原设置。"},
 					"product":               map[string]any{"type": "string", "enum": []string{"appstore", "pcmgr"}, "description": "扫码渠道；省略时使用个人或系统默认。"},
 					"mode":                  map[string]any{"type": "string", "enum": []string{"direct", "static", "api"}, "default": "direct"},
@@ -702,8 +703,9 @@ func newOpenAPISpec() map[string]any {
 					arraySchema(refSchema("AccountPublic")),
 				),
 				"WxappRequest": objectSchema([]string{"ref", "app_id"}, map[string]any{
-					"ref":    map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},
-					"app_id": map[string]any{"type": "string"},
+					"ref":      map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},
+					"app_id":   map[string]any{"type": "string"},
+					"proxyUrl": requestProxySchema(),
 				}),
 				"OperateWXDataRequest": objectSchema([]string{"ref", "app_id", "payload"}, map[string]any{
 					"ref":     map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},

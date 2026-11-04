@@ -126,7 +126,11 @@ func (p *Pool) markSessionVerified(acc *store.WechatAccount, accountID int64, st
 	if window <= 0 {
 		return
 	}
-	p.verified[sessionKey(accountID, st.TCPProxy)] = verifiedSession{Account: acc, At: now, Fingerprint: sessionFingerprint(st)}
+	route := st.cacheRoute
+	if route == "" {
+		route = st.TCPProxy
+	}
+	p.verified[sessionKey(accountID, route)] = verifiedSession{Account: acc, At: now, Fingerprint: sessionFingerprint(st)}
 }
 
 // sessionRecentlyVerified reports whether a wx.login succeeded within
@@ -139,7 +143,7 @@ func (p *Pool) sessionRecentlyVerified(ctx context.Context, current *store.Wecha
 		return false
 	}
 	p.mu.Lock()
-	v, ok := p.verified[sessionKey(current.ID, proxy)]
+	v, ok := p.verified[sessionKey(current.ID, requestSessionKey(ctx, proxy))]
 	p.mu.Unlock()
 	if !ok || time.Since(v.At) >= window {
 		return false
@@ -175,6 +179,7 @@ func (p *Pool) requestLoginCode(ctx context.Context, st WmpfSession, appID strin
 // Rejected OAuth accounts may only use independent native recovery. A candidate
 // replaces the shared cache only after a nonempty code from the same target.
 func (p *Pool) RecoverCodeSession(ctx context.Context, acc *store.WechatAccount, appID, proxy string, fallback bool, original error, fetch func(context.Context) (string, error)) (map[string]any, error) {
+	proxy, fallback = requestAuthenticationProxy(ctx, proxy, fallback)
 	device := p.deviceFor(ctx, acc)
 	return p.recoverCodeSession(ctx, acc, appID, proxy, original, func(ctx context.Context) (WmpfSession, map[string]any, error) {
 		if acc.SessionOnly() {
@@ -247,7 +252,7 @@ func (p *Pool) recoverCodeSession(ctx context.Context, acc *store.WechatAccount,
 		return fail(err)
 	}
 	defer release(lock)
-	stateLock := p.lockFor(fmt.Sprintf("%d\x00%s", acc.ID, proxy))
+	stateLock := p.lockFor(fmt.Sprintf("%d\x00%s", acc.ID, requestSessionKey(ctx, proxy)))
 	if err := acquire(ctx, stateLock); err != nil {
 		return fail(err)
 	}
@@ -276,7 +281,7 @@ func (p *Pool) recoverCodeSession(ctx context.Context, acc *store.WechatAccount,
 		p.events.Emit("protocol.recovery_skipped", eventlog.ForAccount(current).WithTarget(appID, eventlog.OpGetCode, ""))
 		return nil, original
 	}
-	key := fmt.Sprintf("%d\x00%s\x00%s", acc.ID, proxy, appID)
+	key := fmt.Sprintf("%d\x00%s\x00%s", acc.ID, requestSessionKey(ctx, proxy), appID)
 	if hook := repairRegistrationHook; hook != nil {
 		hook()
 	}
@@ -321,10 +326,11 @@ func (p *Pool) recoverCodeSession(ctx context.Context, acc *store.WechatAccount,
 	if st.TCPProxy != proxy {
 		return fail(errors.New("fresh code session route mismatch"))
 	}
+	st.cacheRoute = requestSessionKey(ctx, proxy)
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if !st.nativePersisted {
-		if err := p.db.PutSessionForAccount(saveCtx, current, st.Session.UIN, st.toBlob(), sessionExpiresAt(st, p.cfg.SessionTTL), proxy); err != nil {
+		if err := p.db.PutSessionForAccount(saveCtx, current, st.Session.UIN, st.toBlob(), sessionExpiresAt(st, p.cfg.SessionTTL), requestSessionKey(ctx, proxy)); err != nil {
 			return fail(err)
 		}
 	} else {

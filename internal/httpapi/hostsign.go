@@ -35,12 +35,13 @@ func (a *App) handleHostSignCall(w http.ResponseWriter, r *http.Request, call wx
 	}
 	var body struct {
 		wxappRequest
-		LegacyAppID string `json:"appid"`
-		OpenID      string `json:"openid"`
-		Data        any    `json:"data"`
-		Plugins     any    `json:"plugins"`
-		Provider    string `json:"provider"`
-		Version     any    `json:"inner_version"`
+		LegacyAppID string  `json:"appid"`
+		OpenID      string  `json:"openid"`
+		Data        any     `json:"data"`
+		Plugins     any     `json:"plugins"`
+		Provider    string  `json:"provider"`
+		Version     any     `json:"inner_version"`
+		ProxyURL    *string `json:"proxyUrl"`
 	}
 	if err := decodeOptionalJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -52,6 +53,12 @@ func (a *App) handleHostSignCall(w http.ResponseWriter, r *http.Request, call wx
 	if body.AppID == "" {
 		body.AppID = strings.TrimSpace(body.LegacyAppID)
 	}
+	proxyCtx, proxyErr := withRequestProxy(r.Context(), body.ProxyURL)
+	if proxyErr != nil {
+		writeError(w, http.StatusBadRequest, proxyErr.Error())
+		return
+	}
+	r = r.WithContext(proxyCtx)
 	if body.Data != nil {
 		body.Payload = map[string]any{"data": body.Data}
 	} else if body.Payload == nil && body.Plugins != nil {

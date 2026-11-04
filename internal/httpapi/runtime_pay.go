@@ -18,16 +18,17 @@ import (
 )
 
 type runtimePayRequest struct {
-	Ref           string `json:"ref"`
-	OpenID        string `json:"openid"`
-	AppID         string `json:"appid"`
-	AppIDAlt      string `json:"app_id"`
-	Package       string `json:"package"`
-	PaySign       string `json:"paySign"`
-	NonceStr      string `json:"nonceStr"`
-	TimeStamp     string `json:"timeStamp"`
-	SignType      string `json:"signType"`
-	RuntimeTicket string `json:"runtimeTicket"`
+	ProxyURL      *string `json:"proxyUrl"`
+	Ref           string  `json:"ref"`
+	OpenID        string  `json:"openid"`
+	AppID         string  `json:"appid"`
+	AppIDAlt      string  `json:"app_id"`
+	Package       string  `json:"package"`
+	PaySign       string  `json:"paySign"`
+	NonceStr      string  `json:"nonceStr"`
+	TimeStamp     string  `json:"timeStamp"`
+	SignType      string  `json:"signType"`
+	RuntimeTicket string  `json:"runtimeTicket"`
 }
 
 func isRuntimePayRoute(path string) bool {
@@ -113,13 +114,30 @@ func (a *App) handleRuntimePayCall(w http.ResponseWriter, r *http.Request, payme
 		writeError(w, 400, err.Error())
 		return
 	}
+	ctx, err := withRequestProxy(r.Context(), body.ProxyURL)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	r = r.WithContext(ctx)
 	acc, ok := a.resolveAccountRef(w, r, body.Ref)
 	if !ok {
 		return
 	}
+	plannedCtx, _, _, err := a.wxappProxyPlan(r.Context(), acc.ID)
+	if err != nil {
+		writeError(w, 403, "request proxy is not allowed")
+		return
+	}
+	r = r.WithContext(plannedCtx)
 	// Only session lookup runs through the recoverable protocol pipeline. The
 	// potentially accepted payment UUID request is issued outside it, once.
-	result, err := a.invokeWXApp(r.Context(), acc, body.AppID, nil, sessionCall)
+	requestProxyValue := ""
+	trackedSessionCall := func(ctx context.Context, account *store.WechatAccount, appID string, payload map[string]any, proxy string, fallback bool) (map[string]any, error) {
+		requestProxyValue = proxy
+		return sessionCall(ctx, account, appID, payload, proxy, fallback)
+	}
+	result, err := a.invokeWXApp(r.Context(), acc, body.AppID, nil, trackedSessionCall)
 	if err != nil {
 		var expired accountExpiredError
 		if errors.As(err, &expired) {
@@ -135,12 +153,7 @@ func (a *App) handleRuntimePayCall(w http.ResponseWriter, r *http.Request, payme
 		return
 	}
 	if payment {
-		proxyValue, _, err := a.resolveWXAppProxy(r.Context(), acc.ID)
-		if err != nil {
-			writeError(w, 502, "payment proxy lookup failed")
-			return
-		}
-		result, err = qrCall(r.Context(), body, sessionID, proxyValue)
+		result, err = qrCall(r.Context(), body, sessionID, requestProxyValue)
 		if err != nil {
 			writeError(w, 502, err.Error())
 			return

@@ -83,12 +83,12 @@ func (a *App) handleGatewayCall(w http.ResponseWriter, r *http.Request, authCall
 		writeError(w, 400, "ref and valid app_id are required")
 		return
 	}
-	// Request-only proxy override needs a separate login/business transport seam.
-	// Do not silently apply it to credential acquisition in the target pipeline.
-	if body.ProxyURL != nil {
-		writeError(w, 400, "proxyUrl override is not supported; configure the account proxy")
+	ctx, err := withRequestProxy(r.Context(), body.ProxyURL)
+	if err != nil {
+		writeError(w, 400, err.Error())
 		return
 	}
+	r = r.WithContext(ctx)
 	acc, ok := a.resolveAccountRef(w, r, ref)
 	if !ok {
 		return

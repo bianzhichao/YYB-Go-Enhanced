@@ -66,8 +66,10 @@ type WmpfSession struct {
 	ShortlinkTargets []Target
 	CreatedAt        time.Time
 	TCPProxy         string
-	FallbackDirect   bool
-	CachedOnly       bool
+	// cacheRoute is an in-memory namespace; TCPProxy remains the login route.
+	cacheRoute     string
+	FallbackDirect bool
+	CachedOnly     bool
 	// Device is derived per account on every use and is never persisted.
 	Device          DeviceIdentity
 	recoveryRow     *store.SessionRow
@@ -153,6 +155,7 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 }
 
 func (p *Pool) getCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
+	tcpProxy, fallbackDirect = requestAuthenticationProxy(ctx, tcpProxy, fallbackDirect)
 	call := func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		result, err := p.requestLoginCode(ctx, st, appID)
 		if err == nil {
@@ -190,7 +193,7 @@ func retryLoginCode(ctx context.Context, call func() (map[string]any, error), in
 		}
 		return nil, ErrLoginCodeUnavailable
 	}
-	if IsApplicationRequestRejection(err) || !errors.Is(err, ErrShortlinkPayload) {
+	if IsNoRetry(err) || IsApplicationRequestRejection(err) || !errors.Is(err, ErrShortlinkPayload) {
 		return result, err
 	}
 	if ctx.Err() != nil {
@@ -244,11 +247,11 @@ func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, pay
 }
 
 func (p *Pool) Invalidate(ctx context.Context, accountID int64, tcpProxy string) error {
-	return p.db.InvalidateSession(ctx, accountID, tcpProxy)
+	return p.db.InvalidateSession(ctx, accountID, requestSessionKey(ctx, tcpProxy))
 }
 
 func (p *Pool) invalidateExpected(ctx context.Context, accountID int64, proxy string, expected ...*store.WechatAccount) error {
-	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, proxy))
+	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, requestSessionKey(ctx, proxy)))
 	if err := acquire(ctx, lock); err != nil {
 		return err
 	}
@@ -270,12 +273,15 @@ func (p *Pool) invalidateExpected(ctx context.Context, accountID int64, proxy st
 		return ErrCachedSessionUnavailable
 	}
 	if len(expected) > 0 {
-		return p.db.InvalidateSessionForAccount(ctx, expected[0], proxy)
+		return p.db.InvalidateSessionForAccount(ctx, expected[0], requestSessionKey(ctx, proxy))
 	}
 	return p.Invalidate(ctx, accountID, proxy)
 }
 
 func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, fallbackDirect bool, op func(context.Context, WmpfSession) (map[string]any, error), expected ...*store.WechatAccount) (map[string]any, error) {
+	if _, override := ctx.Value(requestProxiesKey{}).(requestProxies); override {
+		return p.runRequestProxy(ctx, loginBuffer, accountID, op, expected...)
+	}
 	st, err := p.state(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, expected...)
 	if err == nil {
 		st.FallbackDirect = fallbackDirect
@@ -299,7 +305,8 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	return nil, err
 }
 
-func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (WmpfSession, error) {
+func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (out WmpfSession, resultErr error) {
+	defer func() { out.cacheRoute = requestSessionKey(ctx, tcpProxy) }()
 	// Include the queue wait in the login budget, not just the socket work.
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
 	defer cancel()
@@ -320,7 +327,7 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return WmpfSession{}, err
 	}
-	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, tcpProxy))
+	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, requestSessionKey(ctx, tcpProxy)))
 	if err := acquire(ctx, lock); err != nil {
 		return WmpfSession{}, err
 	}
@@ -371,17 +378,17 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	uin := st.Session.UIN
 	expiresAt := sessionExpiresAt(st, p.cfg.SessionTTL)
 	blob := st.toBlob()
-	if err = p.db.PutSessionForAccount(ctx, acc, uin, blob, expiresAt, tcpProxy); err != nil {
+	if err = p.db.PutSessionForAccount(ctx, acc, uin, blob, expiresAt, requestSessionKey(ctx, tcpProxy)); err != nil {
 		return WmpfSession{}, err
 	}
 	return st, nil
 }
 
 func (p *Pool) cachedSession(ctx context.Context, accountID int64, tcpProxy string) (WmpfSession, error) {
-	row, err := p.db.GetSession(ctx, accountID, tcpProxy)
+	row, err := p.db.GetSession(ctx, accountID, requestSessionKey(ctx, tcpProxy))
 	legacyDeadline := errors.Is(err, sql.ErrNoRows)
 	if legacyDeadline {
-		row, err = p.db.GetSessionForRecovery(ctx, accountID, tcpProxy)
+		row, err = p.db.GetSessionForRecovery(ctx, accountID, requestSessionKey(ctx, tcpProxy))
 	}
 	if err != nil {
 		return WmpfSession{}, err
@@ -409,6 +416,7 @@ func (p *Pool) cachedSession(ctx context.Context, accountID int64, tcpProxy stri
 
 // This checks local eligibility only; it does not assert server acceptance.
 func (p *Pool) HasReusableSession(ctx context.Context, accountID int64, tcpProxy string) bool {
+	tcpProxy, _ = requestAuthenticationProxy(ctx, tcpProxy, false)
 	st, err := p.cachedSession(ctx, accountID, tcpProxy)
 	if err != nil || st.PSK.PSKType != 1 || st.PSK.ExpiredAt <= time.Now().Unix() {
 		return p.hasNativeRecovery(ctx, accountID, tcpProxy)
@@ -559,7 +567,8 @@ func (p *Pool) sendEnvelope(ctx context.Context, st WmpfSession, envelope []byte
 	defer release(p.shortlinkSem)
 	reqCtx, cancel := context.WithTimeout(ctx, p.cfg.ShortlinkTimeout)
 	defer cancel()
-	return send0RTT(reqCtx, st.ShortlinkTargets, st.PSK, st.Session.RecvKey, envelope, p.cfg.ShortlinkTimeout, st.TCPProxy, st.FallbackDirect)
+	proxy, fallback := requestBusinessProxy(ctx, st.TCPProxy, st.FallbackDirect)
+	return send0RTT(reqCtx, st.ShortlinkTargets, st.PSK, st.Session.RecvKey, envelope, p.cfg.ShortlinkTimeout, proxy, fallback)
 }
 
 func acquire(ctx context.Context, sem chan struct{}) error {

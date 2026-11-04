@@ -49,7 +49,7 @@ func (p *Pool) nativeRecoveryState(ctx context.Context, accountID int64, proxy s
 	if p.db == nil {
 		return WmpfSession{}, ErrCachedSessionUnavailable
 	}
-	row, err := p.db.GetSessionForRecovery(ctx, accountID, proxy)
+	row, err := p.db.GetSessionForRecovery(ctx, accountID, requestSessionKey(ctx, proxy))
 	if err != nil {
 		return WmpfSession{}, err
 	}

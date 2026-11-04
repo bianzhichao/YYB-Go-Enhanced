@@ -11,13 +11,16 @@ func addPortedOpenAPI(spec map[string]any) {
 		"/wxapp/getWxaCDNDownloadUrl": "查询下载地址，payload 含 version、versionMd5、moduleName",
 		"/wxapp/getA8Key":             "专用 A8Key CGI，payload.target_url 必填，biz_username、scene 可选",
 		"/wxapp/userRollList":         "A8Key 后查询 HTTPS 微信或财付通 JSON，payload.target_url 必填",
+		"/wxapp/oauthAuthorize":       "获取小程序 OAuth 授权信息（只解析授权状态，不代替用户同意）",
+		"/wxapp/proxyProfiles":        "普通 scoped key 创建并绑定静态代理配置",
 	} {
 		paths[path] = wxAliasOperation(summary, "WxappRequest", "WxappResponse")
 	}
+	paths["/wxapp/proxyProfiles"] = map[string]any{"post": openAPIOperation([]string{"wxapp"}, "由普通 scoped key 创建并绑定静态代理配置", nil, jsonRequestBody(objectSchema([]string{"name", "provider", "proxy_type", "api_url"}, map[string]any{"name": stringSchema(), "provider": map[string]any{"type": "string", "enum": []string{"static"}}, "proxy_type": map[string]any{"type": "string", "enum": []string{"http", "socks5"}}, "api_url": map[string]any{"type": "string", "description": "静态代理地址；凭据由当前 Key 自行提供。"}})), defaulted(map[string]any{"200": jsonResponse("已创建且绑定到当前 Key 的代理配置。", freeFormObjectSchema("proxy profile。"))}))}
 	flat := objectSchema([]string{"ref", "app_id"}, map[string]any{
 		"ref": stringSchema(), "app_id": stringSchema(), "appid": stringSchema(), "openid": stringSchema(),
 	})
-	for _, path := range []string{"/wxapp/getRuntimeSession", "/wxapp/getPayQRCode", "/wxapp/gatewayv3", "/wx/gatewayv3", "/wxapp/getWxaCode"} {
+	for _, path := range []string{"/wxapp/getRuntimeSession", "/wxapp/getPayQRCode", "/wxapp/gatewayv3", "/wx/gatewayv3", "/wxapp/getWxaCode", "/wxapp/thirdAppAuthorize", "/wxapp/getAppMsgExt"} {
 		request := map[string]any{}
 		for k, v := range flat {
 			request[k] = v
@@ -50,14 +53,52 @@ func addPortedOpenAPI(spec map[string]any) {
 			properties["downloadUrl"] = map[string]any{"type": "string", "description": "可选，受限微信 CDN HTTPS URL；省略则先查询属性和各模块下载地址。"}
 			properties["payload"] = freeFormObjectSchema("属性查询参数。")
 			response = defaulted(map[string]any{"200": map[string]any{"description": "完整 ZIP；任何模块失败均不返回部分成功。", "content": map[string]any{"application/zip": map[string]any{"schema": map[string]any{"type": "string", "format": "binary"}}}}})
+		case "/wxapp/thirdAppAuthorize":
+			summary = "创建第三方应用授权二维码，授权确认流程分步完成"
+			properties["bundleid"] = stringSchema()
+		case "/wxapp/getAppMsgExt":
+			summary = "读取文章扩展信息，需 A8Key 和目标文章 URL"
+			properties["target_url"] = stringSchema()
+			properties["biz_username"] = stringSchema()
 		}
 		paths[path] = map[string]any{"post": openAPIOperation([]string{"wxapp"}, summary, nil, jsonRequestBody(request), response)}
+	}
+	for _, path := range []string{"/wxapp/getHostSign", "/wxapp/checkShortUrl", "/wxapp/wxaAttrSync", "/wxapp/wxaAppSync", "/wxapp/getWxaCDNDownloadUrl", "/wxapp/getAllPhone", "/wx/getallphonenumber", "/wxapp/getA8Key", "/wxapp/userRollList", "/wxapp/oauthAuthorize", "/wxapp/thirdAppAuthorize", "/wxapp/getAppMsgExt", "/wxapp/getWxaCode", "/wxapp/getRuntimeSession", "/wxapp/getPayQRCode", "/wxapp/gatewayv3", "/wx/gatewayv3"} {
+		item, ok := paths[path].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, operation := range item {
+			if op, ok := operation.(map[string]any); ok {
+				requestBody, ok := op["requestBody"].(map[string]any)
+				if !ok {
+					continue
+				}
+				content, ok := requestBody["content"].(map[string]any)
+				if !ok {
+					continue
+				}
+				appJSON, ok := content["application/json"].(map[string]any)
+				if !ok {
+					continue
+				}
+				schema, ok := appJSON["schema"].(map[string]any)
+				if !ok {
+					continue
+				}
+				properties, ok := schema["properties"].(map[string]any)
+				if ok {
+					properties["proxyUrl"] = requestProxySchema()
+				}
+			}
+		}
 	}
 	paths["/auth/keys"] = map[string]any{}
 	for _, method := range []string{"get", "post", "put", "delete"} {
 		paths["/auth/keys"].(map[string]any)[method] = openAPIOperation([]string{"accounts"}, "管理账号/代理范围 API Key（仅管理员浏览器会话；创建或轮换只展示一次明文）", []map[string]any{{"name": "id", "in": "query", "schema": int64Schema()}}, nil, defaulted(map[string]any{"200": jsonResponse("Key 元数据，不包含持久化明文。", freeFormObjectSchema("POST/PUT 使用 name、account_ids、proxy_ids、exclusive、enabled、rotate。"))}))
 	}
 	paths["/api/merchant/bills"] = map[string]any{"get": openAPIOperation([]string{"accounts"}, "查询本地账单（浏览器会话，普通用户仅自己的账号）", nil, nil, defaulted(map[string]any{"200": jsonResponse("本地账单，不证明支付结算。", map[string]any{"type": "array", "items": freeFormObjectSchema("账单。")})}))}
+	paths["/api/proxy-accounts/migrate"] = map[string]any{"post": openAPIOperation([]string{"proxy-profiles"}, "将使用一个动态代理配置的账号迁移到另一个配置；地区匹配不唯一或缺失的账号跳过", nil, jsonRequestBody(objectSchema([]string{"from_provider_profile_id", "to_provider_profile_id"}, map[string]any{"from_provider_profile_id": int64Schema(), "to_provider_profile_id": int64Schema(), "account_ids": map[string]any{"type": "array", "items": int64Schema(), "maxItems": 1000}})), defaulted(map[string]any{"200": jsonResponse("迁移与跳过账号及原因。", freeFormObjectSchema("migrated、skipped 数组。"))}))}
 }
 
 func stringSchema() map[string]any { return map[string]any{"type": "string"} }

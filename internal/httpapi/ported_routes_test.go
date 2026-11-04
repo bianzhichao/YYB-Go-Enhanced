@@ -14,7 +14,7 @@ func TestPortedRoutesAreWiredAndProtected(t *testing.T) {
 	}
 	defer a.Close()
 	h := a.Handler()
-	for _, path := range []string{"/wxapp/getHostSign", "/Wxapp/GetHostSign", "/api/Wxapp/GetHostSign", "/wxapp/getAllPhone", "/wx/getallphonenumber", "/wxapp/checkShortUrl", "/wxapp/wxaAttrSync", "/wxapp/wxaAppSync", "/wxapp/getWxaCDNDownloadUrl", "/wxapp/gatewayv3", "/wx/gatewayv3", "/wxapp/getRuntimeSession", "/Wxapp/JSGetSessionid", "/api/Wxapp/JSGetSessionid", "/wxapp/getPayQRCode", "/wxapp/getWxaCode", "/wxapp/getA8Key", "/wxapp/userRollList"} {
+	for _, path := range []string{"/wxapp/getHostSign", "/Wxapp/GetHostSign", "/api/Wxapp/GetHostSign", "/wxapp/getAllPhone", "/wx/getallphonenumber", "/wxapp/checkShortUrl", "/wxapp/wxaAttrSync", "/wxapp/wxaAppSync", "/wxapp/getWxaCDNDownloadUrl", "/wxapp/gatewayv3", "/wx/gatewayv3", "/wxapp/getRuntimeSession", "/Wxapp/JSGetSessionid", "/api/Wxapp/JSGetSessionid", "/wxapp/getPayQRCode", "/wxapp/getWxaCode", "/wxapp/getA8Key", "/wxapp/userRollList", "/wxapp/proxyProfiles", "/wxapp/oauthAuthorize", "/wxapp/thirdAppAuthorize", "/wxapp/getAppMsgExt"} {
 		for _, authorized := range []bool{false, true} {
 			r := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
 			if authorized {
@@ -25,6 +25,9 @@ func TestPortedRoutesAreWiredAndProtected(t *testing.T) {
 			want := http.StatusUnauthorized
 			if authorized {
 				want = http.StatusBadRequest
+				if path == "/wxapp/proxyProfiles" {
+					want = http.StatusForbidden
+				}
 			}
 			if w.Code != want {
 				t.Errorf("%s authorized=%t status=%d want=%d body=%s", path, authorized, w.Code, want, w.Body)

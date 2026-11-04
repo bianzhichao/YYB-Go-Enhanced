@@ -6,6 +6,8 @@
 
 原清单的 13 个确认缺失项已补入目标架构；另补独立 A8Key，作为 userRollList 的必要依赖。实现、离线验证与线上兼容分开记录。没有使用真实账号或真实支付请求验收。
 
+后续继续移植了原来标为差异或待补的接口：请求级 `proxyUrl`、专用 OAuth/第三方授权/AppMsgExt、API Key 扫码归属、静态代理 profile 创建和管理员代理 profile 迁移。
+
 ## 功能与证据
 
 源文件位置均相对于上述参考目录；目标位置均相对于本仓库。
@@ -26,6 +28,12 @@
 | STORE-ONLINE | 源 `internal/store/store.go` 的 OnlineSince/OnlineEndedAt/OnlineBasis 和首页展示：最近观测区间 | 目标无这些字段；Web last_login_at 不等价 | 目标 `store.go`、`account_rebind.go`、`account_merge.go` 与首页模板。可空迁移；显示观测开始/结束/依据，不推算未知历史 |
 | AUTH-APIKEY | 源 `store.go` 的 AuthKey 系列方法、`httpapi/exclusive_keys.go`、`account_list_acl.go`：多 Key、账号/代理范围、撤销、独占归属 | 目标只有全局 ProtocolToken 和 Web 用户归属，无 scoped key 数据及入口 | `internal/store/auth_keys.go`、`internal/httpapi/scoped_keys.go`；`/auth/keys`，账号、业务代理、凭据代理均检查；保持原 Web ownership |
 | CORE-A8KEY（依赖项） | 源 `pool.go` 的 GetA8Key 与 `ilink.go` 的 buildMPa8keyRequest/解析：专用 CGI | 目标只有 generic operateWxData alias；实验测试不构成正式专用接口 | `internal/protocol/a8key.go`、`internal/httpapi/user_roll.go`；`/wxapp/getA8Key`。旧 `/wx/mpgeta8key` 保留原行为 |
+| AUTH-ENROLLMENT | 源 `store.go` 扫码事务接受 owner_key_ids，`app.go` 固定 owner_key_id 到 QR 流程；普通 Key 创建代理节点并绑定 | 基线无 scoped Key 自助二维码归属与节点绑定 | `internal/store/auth_key_enrollment.go`、`internal/httpapi/scoped_enrollment.go`；普通 scoped key 的二维码创建时固定归属，确认扫描时账号与 Key 授权同事务写入。已存在账号只允许该 Key 已授权的账号重扫；排他冲突拒绝 |
+| CORE-OAUTH | 源 `protocol/pool.go` OauthAuthorize、`ilink.go` CGI1254 builder/parser、`httpapi/app.go` OAuth handler | 目标 `/wx/oauth` 只生成授权链接，不请求专用 CGI | `internal/protocol/oauth_authorize.go`、`internal/httpapi/oauth_protocol.go`；`/wxapp/oauthAuthorize`。返回授权信息，不绕过用户同意 |
+| CORE-THIRDAPP | 源 `httpapi/app.go` 的 ThirdAppAuthorize：qrconnect、A8Key 确认 URL、一次确认及一次取 code | 基线没有第三方扫码确认链 | `internal/httpapi/oauth_protocol.go`；`/wxapp/thirdAppAuthorize`。保留 pending 错误，不能声称扫码授权完成 |
+| CORE-APPMSGEXT | 源 `httpapi/app.go` 的 GetAppMsgExt：A8Key 加微信公众号文章扩展查询 | 基线 `/wx/appmsgext` 是 generic operateWxData | `internal/httpapi/appmsg_ext.go`；专用 `/wxapp/getAppMsgExt`；旧 generic 路由保持 |
+| PROXY-REQUEST | 源 `internal/httpapi/request_proxy.go`：每次请求独立选登录出口与业务出口 | 基线无 `proxyUrl`；账号代理绑定不等价于一次性覆写 | `internal/protocol/request_proxy.go`、`internal/httpapi/request_proxy.go` 与协议池：null 继承、空串业务直连、URL 仅覆盖本次业务代理；登录和刷新仍走账号设置，缓存按双路由隔离，失败不直连重试 |
+| PROXY-MIGRATE | 源 `internal/httpapi/app.go` 的 handleProxyAccountMigrate：按省市将账号从旧动态节点批量迁到另一节点 | 基线无对应批量 profile 迁移接口 | `internal/store/proxy_migration.go`、`internal/httpapi/proxy_migration.go`；管理员 `POST /api/proxy-accounts/migrate`。事务批量更新、失效会话/lease；跨供应商地区必须唯一完整匹配 |
 
 ## 调用方式
 
@@ -46,7 +54,7 @@
 1. 目标沿用手写 protobuf、Pool.run、稳定设备身份、授权快照、pacing/circuit 与代理体系，没有复制源整个 generated protobuf 或 go.mod。新增业务/解析终止错误标记 `NoRetryError`，在协议代理回退和 HTTP 凭据恢复两层阻止重放。
 2. 源 HostSign 请求可接受 legacy 参数；返回沿用目标 `code/msg/data` 以及账号/result 包装。源 `Status/Message/Data` envelope 没有整体替换目标合同。
 3. 源“确认收款”只是 sleep 后把本地状态写成 done。目标明确显示“手工标记本地账单状态，未执行支付结算”，不复制“收款成功”的无依据结论；复用主 DB 而非第二套连接。
-4. 源代理节点与目标 proxy provider profile 模型不同。新 Key 的 `proxy_ids` 指目标 profile ID，不能直接导入旧节点 ID。源请求级 `proxyUrl` 在 Gateway 中尚未移植，显式传入会被拒绝；使用已保存账号代理。Gateway、支付、下载业务 HTTP 禁止失败后回落直连，避免不确定重放。
+4. 源代理节点与目标 proxy provider profile 模型不同。新 Key 的 `proxy_ids` 指目标 profile ID，不能直接导入旧节点 ID。请求级 `proxyUrl` 只作用当前调用；scoped key 的非空代理必须与该账号已绑定 profile 当前解析出的代理一致。扫码自助代理只创建静态目标 profile；动态供应商仍由管理员先配置。批量迁移跨供应商需完整唯一的省市目录匹配，否则跳过；不能撤回已发出的在途请求。Gateway、支付、下载业务 HTTP 禁止失败后回落直连，避免不确定重放。
 5. 源 getAllPhone 请求 JSON 少一个右括号；目标用 json.Marshal 构造完整对象。源 wxaAppSync alias 被原 handler 的路径判断拒绝；目标修正别名路径。
 6. wxapkg 对错误、路径、符号链接、Windows 保留名、包/文件/分包数量、总量和重定向采用明确边界。`BeautifyFile`、`ScanAllRequires`、`ResolveDeps` 返回 error，`WriteTo` 返回 `(int64,error)`。依赖网络只允许 HTTPS unpkg.com。未知 CDN 不自动扩大白名单。
 7. QR 登录、getCode、单号码授权、operateWxData、MMTLS/ILink、保活和诊断在目标已有；保留目标实现。OAuth `/wx/oauth` 继续生成链接；generic AppMsgExt、CreateWxaShortLink 不因源多了 wrapper 而记为整个能力缺失。
@@ -59,10 +67,10 @@
 | 真实账号与上游接受情况 | 本轮只执行离线测试、合成报文和本地 HTTP 模拟；HostSign、全部新 CGI、A8Key/userRoll 的真实返回布局及 Cookie 语义尚未在线确认 |
 | RuntimeSession / Payment | 源本身声明实验性；返回 experimental。没有验证支付请求被微信接受、扫码付款、结算、回调或退款 |
 | 指定手机号授权 | 列表查询已实现；源没有已确认的“指定列表号码完成授权”实现，不能声称已补齐 |
-| 请求级代理 | 源有 proxyUrl 和登录/业务代理分离，目标本次未完整移植；不是保存账号代理功能缺失 |
-| 专用 OAuth / ThirdAppAuthorize / AppMsgExt | 与目标 generic/URL 生成存在差异；完整授权自动确认、dedicated AppMsgExt 仍待进一步独立移植与上游验证。现有实验测试不等于生产能力 |
+| 请求级代理动态节点固定 | 每次协议调用和同一下载/支付子请求复用已解析的业务代理，登录/刷新仍走账号代理；动态 API 的刷新提前量、迁移时已在途的网络请求仍按调用时序生效 |
+| OAuth / ThirdAppAuthorize / AppMsgExt 实际上游结果 | 专用接口和单次确认流程已实现并有离线 mock；真实微信用户同意、sessionId/cookie/code 线上交换尚未验证，不把 API 响应等同完成授权 |
 | 解密生产调用链 | 源有解密库，但源下载 handler 仅确认调用 Unpack。目标现在按 V1MMWX 头选择解密；合成往返通过，真实密文和实际 CDN 域范围待确认 |
-| scoped Key 新扫码自动归属 | 当前按已保存账号 ID 分配与独占；源专用扫码即归属/旧节点自动绑定行为未完整搬入，需与目标 Web ownership 和换绑合同另作适配 |
+| scoped Key 动态代理自助 | 新 Key 可创建绑定静态 profile；旧动态节点 ID 不导入，动态 profile 仍由管理员配置和绑定 |
 | 商户实际资金结算 | 源只有本地状态，未找到微信支付查询、回调验签或结算实现；没有补造这类功能 |
 | `_dp_adapter.py` | 缺少其导入的 `_dp_runtime/_dp_records/_dp_transport/_dp_logmode/_dp_cash_recovery/_dp_core`。不完整的其他业务适配器，未导入服务 |
 | Utils.go、生成 pb、旧错误辅助文件 | 文件数量不是功能数；已用到的字段按行为迁移，未承诺旧内部符号级兼容 |
@@ -72,5 +80,7 @@
 离线覆盖：协议构造/解析、截断及上游错误、手机号列表、Gateway 加密回环与单次业务发送、Runtime 支付参数及单次 UUID 请求、受保护路由、Key 管理/隔离/撤销/代理/编号重映射、本地账单 ownership、在线状态迁移、wxapkg 合成解密解包、路径边界和跨模块 ZIP。
 
 最终集成验证：`go test ./...` 全部 14 个包通过；`go build ./...`、`go vet ./...`、`git diff --check` 均退出 0。环境为 Windows/amd64、Go 1.26.0。未执行容器构建、跨平台运行或真实账号/实际支付调用。
+
+继续移植后的复验：原差异域定向回归通过；`go test ./...`、`go build ./...`、`go vet ./...` 和 `git diff --check` 再次全部退出 0。覆盖请求代理路由隔离、OAuth/第三方授权离线模拟、scoped 扫码绑定/静态代理绑定、管理员批量迁移事务。全程没有真实账号、扫码同意、动态代理付费或支付请求。
 
 六个已有员工聊天均先读取核实；先派员工1并确认真实 commandExecution 输出，再展开其余独立任务。员工1、2、5、6在实际读取后因模型服务 `403 insufficient balance` 中断，没有把这些尝试计为交付。员工3交付在线区间、员工4交付 wxapkg 和质量审查；有效类型 default 的临时员工补齐受阻域，PM负责公共接线与集成。审查发现的编号错绑、错误重放、Windows ZIP 前缀均有离线回归修复。

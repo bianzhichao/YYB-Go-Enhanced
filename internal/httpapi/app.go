@@ -405,6 +405,10 @@ func (a *App) Handler() http.Handler {
 	protocolRoutes.Any("/wxapp/getWxaCode", gin.WrapF(a.handleGetWxaCode))
 	protocolRoutes.Any("/wxapp/getA8Key", gin.WrapF(a.handleGetA8Key))
 	protocolRoutes.Any("/wxapp/userRollList", gin.WrapF(a.handleUserRollList))
+	protocolRoutes.Any("/wxapp/proxyProfiles", gin.WrapF(a.handleScopedProxyEnrollment))
+	protocolRoutes.Any("/wxapp/oauthAuthorize", gin.WrapF(a.handleOauthAuthorize))
+	protocolRoutes.Any("/wxapp/thirdAppAuthorize", gin.WrapF(a.handleThirdAppAuthorize))
+	protocolRoutes.Any("/wxapp/getAppMsgExt", gin.WrapF(a.handleGetAppMsgExt))
 	protocolRoutes.Any("/wx/code", gin.WrapF(a.handleWXCodeAlias))
 	protocolRoutes.Any("/wx/getuserinfo", gin.WrapF(a.handleWXGetUserInfo))
 	protocolRoutes.Any("/wx/encryptkey", gin.WrapF(a.handleWXEncryptKey))
@@ -429,6 +433,7 @@ func (a *App) Handler() http.Handler {
 	router.Any("/account-link/:token/*path", gin.WrapF(a.handleAccountLink))
 
 	router.Use(a.requireBrowserSession())
+	router.POST("/api/proxy-accounts/migrate", gin.WrapF(a.handleProxyAccountMigrate))
 	router.Any("/auth/keys", gin.WrapF(a.handleAuthKeys))
 	router.Any("/merchant", gin.WrapF(a.handleMerchantPage))
 	router.Any("/api/merchant/bills", gin.WrapF(a.handleMerchantBills))
@@ -594,11 +599,20 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
+	enrollment, err := a.prepareScopedEnrollment(w, r, body.OwnerKeyID)
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.RequestTimeout+35*time.Second)
 	defer cancel()
 	normalizedBody, proxySpec, err := a.normalizeAccountProxyInput(ctx, body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := a.scopedEnrollmentProxyAllowed(r, body, proxySpec); err != nil {
+		writeError(w, 403, err.Error())
 		return
 	}
 	client, resolvedProxy, err := a.qrClientForSpec(ctx, proxySpec)
@@ -614,6 +628,7 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	a.qrSessions[img.Session.ID] = &qrLoginSession{
 		Session: img.Session, Client: client, ProxySpec: proxySpec, ProxyIn: normalizedBody,
+		Enrollment: enrollment,
 		ImageBytes: append([]byte(nil), img.ImageBytes...),
 	}
 	keep := make(map[string]bool, len(a.qrSessions))
@@ -656,6 +671,13 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessionID, action := parts[0], parts[1]
+	login := a.getQRSession(sessionID)
+	if login != nil {
+		if err := a.checkScopedEnrollment(w, r, login.Enrollment); err != nil {
+			writeError(w, 403, err.Error())
+			return
+		}
+	}
 	switch action {
 	case "image":
 		if r.Method != http.MethodGet {
@@ -680,7 +702,6 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		login := a.getQRSession(sessionID)
 		if login == nil {
 			writeError(w, http.StatusNotFound, "qr session not found")
 			return
@@ -709,7 +730,6 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		login := a.getQRSession(sessionID)
 		if login == nil {
 			writeError(w, http.StatusNotFound, "qr session not found")
 			return
@@ -747,17 +767,24 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, err.Error())
 			return
 		}
-		acc, err := a.storeFromScan(r.Context(), result.LoginBuffer, result.Credentials, userInfo)
+		scanCtx, err := a.scopedScanContext(w, r, login.Enrollment)
+		if err != nil {
+			writeError(w, 403, err.Error())
+			return
+		}
+		acc, err := a.storeFromScan(scanCtx, result.LoginBuffer, result.Credentials, userInfo)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if err := a.claimScannedAccount(r, acc.ID); err != nil {
-			if !existed {
-				_ = a.db.DeleteAccount(r.Context(), acc.ID)
+		if login.Enrollment == nil || login.Enrollment.CreatorKeyID == 0 {
+			if err := a.claimScannedAccount(r, acc.ID); err != nil {
+				if !existed {
+					_ = a.db.DeleteAccount(r.Context(), acc.ID)
+				}
+				writeError(w, http.StatusForbidden, err.Error())
+				return
 			}
-			writeError(w, http.StatusForbidden, err.Error())
-			return
 		}
 		if err := a.saveNewAccountProxy(r.Context(), acc.ID, existed, login.ProxyIn, login.ProxySpec); err != nil {
 			if !existed {
@@ -1119,9 +1146,10 @@ type accountRefIn struct {
 }
 
 type wxappRequest struct {
-	Ref     string         `json:"ref"`
-	AppID   string         `json:"app_id"`
-	Payload map[string]any `json:"payload"`
+	Ref      string         `json:"ref"`
+	AppID    string         `json:"app_id"`
+	Payload  map[string]any `json:"payload"`
+	ProxyURL *string        `json:"proxyUrl"`
 }
 
 type wxappCall func(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error)
@@ -1149,6 +1177,12 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		writeError(w, http.StatusBadRequest, "payload is required")
 		return
 	}
+	proxyCtx, proxyErr := withRequestProxy(r.Context(), body.ProxyURL)
+	if proxyErr != nil {
+		writeError(w, http.StatusBadRequest, proxyErr.Error())
+		return
+	}
+	r = r.WithContext(proxyCtx)
 	for _, validate := range validators {
 		if err := validate(body.AppID, body.Payload); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -1386,7 +1420,7 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 	nick := pickNickname(userInfo, creds.Nickname)
 	avatar := a.resolveAvatar(ctx, openid, userInfo)
 	status := "alive"
-	acc, err := a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMapForScan(), &status)
+	acc, err := a.saveScannedAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMapForScan(), &status)
 	if err == nil {
 		// A new authorization starts with a clean breaker.
 		a.circuit.forget(acc.ID)
@@ -1459,6 +1493,10 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	if accountNeedsRescan(acc) {
 		return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID}
 	}
+	ctx, plannedProxy, plannedFallback, planErr := a.wxappProxyPlan(ctx, acc.ID)
+	if planErr != nil {
+		return nil, fmt.Errorf("resolve account proxy: %w", planErr)
+	}
 	if breakerErr := a.circuit.check(acc.ID, appID, op); breakerErr != nil {
 		return nil, breakerErr
 	}
@@ -1468,10 +1506,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	if paceErr := a.paceWXApp(ctx, acc); paceErr != nil {
 		return nil, paceErr
 	}
-	proxyValue, fallbackDirect, err := a.resolveWXAppProxy(ctx, acc.ID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve account proxy: %w", err)
-	}
+	proxyValue, fallbackDirect := plannedProxy, plannedFallback
 	result, callErr := call(ctx, acc, appID, payload, proxyValue, fallbackDirect)
 	a.recordCircuitOutcome(acc, appID, op, callErr)
 	if callErr == nil {

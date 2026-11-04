@@ -271,6 +271,7 @@ func (a *App) handleGetWxaCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
+		ProxyURL    *string        `json:"proxyUrl"`
 		Ref         string         `json:"ref"`
 		OpenID      string         `json:"openid"`
 		AppID       string         `json:"appid"`
@@ -282,6 +283,12 @@ func (a *App) handleGetWxaCode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid JSON")
 		return
 	}
+	requestCtx, err := withRequestProxy(r.Context(), body.ProxyURL)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	r = r.WithContext(requestCtx)
 	body.Ref = runtimeFirstNonEmpty(body.Ref, body.OpenID)
 	body.AppID = runtimeFirstNonEmpty(body.AppIDAlt, body.AppID)
 	if !runtimeAppIDValid(body.AppID) {
@@ -300,6 +307,12 @@ func (a *App) handleGetWxaCode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	plannedCtx, _, _, err := a.wxappProxyPlan(r.Context(), acc.ID)
+	if err != nil {
+		writeError(w, 403, "request proxy is not allowed")
+		return
+	}
+	r = r.WithContext(plannedCtx)
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
 	defer cancel()
 	entries := []wxaCodeModule{{url: body.DownloadURL}}
@@ -331,7 +344,7 @@ func (a *App) handleGetWxaCode(w http.ResponseWriter, r *http.Request) {
 			entries = append(entries, wxaCodeModule{name, downloadURL})
 		}
 	}
-	proxyValue, _, err := a.resolveWXAppProxy(ctx, acc.ID)
+	_, proxyValue, _, err := a.wxappProxyPlan(ctx, acc.ID)
 	if err != nil {
 		writeError(w, 502, "CDN proxy lookup failed")
 		return

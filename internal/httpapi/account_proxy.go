@@ -31,6 +31,7 @@ type accountProxyIn struct {
 	RegionCity          string  `json:"region_city"`
 	RefreshAheadMinutes int64   `json:"refresh_ahead_minutes"`
 	ProtocolProxyMode   *string `json:"protocol_proxy_mode"`
+	OwnerKeyID          *int64  `json:"owner_key_id"`
 }
 
 const loginProductAppStore = "appstore"
@@ -56,6 +57,7 @@ type qrLoginSession struct {
 	ProxyIn   accountProxyIn
 	// Optional one-time account-link binding. Zero means a normal console QR.
 	AccountLinkID   int64
+	Enrollment      *scopedEnrollment
 	AccountLinkHash string
 	AccountLinkMode string
 	BaseAccountID   int64
@@ -310,6 +312,33 @@ func (a *App) resolveAccountProxy(ctx context.Context, accountID int64) (string,
 		return "", false, ctx.Err()
 	}
 	defer func() { <-leaseLock }()
+	// A migration may have committed while this request waited for the account
+	// lease lock. Refresh the setting before using a cached or newly resolved node.
+	fresh, freshErr := a.db.GetAccountProxySetting(ctx, accountID)
+	if errors.Is(freshErr, sql.ErrNoRows) {
+		if strings.TrimSpace(a.cfg.TCPProxy) == "" {
+			return "", false, nil
+		}
+		normalized, normalizeErr := proxysource.NormalizeSpec(proxysource.Spec{Mode: "static", StaticProxy: a.cfg.TCPProxy})
+		if normalizeErr != nil {
+			return "", false, normalizeErr
+		}
+		return normalized.StaticProxy, true, nil
+	}
+	if freshErr != nil {
+		return "", false, freshErr
+	}
+	if fresh.UpdatedAt != setting.UpdatedAt {
+		setting = fresh
+		spec, err = a.proxySpecForSetting(ctx, setting)
+		if err != nil {
+			return "", false, err
+		}
+		if spec.Mode != "api" {
+			proxyValue, resolveErr := a.resolveProxySpec(ctx, spec)
+			return proxyValue, false, resolveErr
+		}
+	}
 	a.proxyMu.Lock()
 	if lease, ok := a.proxyLeases[accountID]; ok && lease.SettingUpdatedAt == setting.UpdatedAt && time.Now().Before(lease.ExpiresAt) {
 		a.proxyMu.Unlock()
