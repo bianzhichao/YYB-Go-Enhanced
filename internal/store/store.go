@@ -148,6 +148,9 @@ type WechatAccount struct {
 	Credentials    map[string]any `json:"credentials,omitempty"`
 	Status         *string        `json:"status,omitempty"`
 	LastCheckedAt  *int64         `json:"last_checked_at,omitempty"`
+	OnlineSince    *int64         `json:"online_since,omitempty"`
+	OnlineEndedAt  *int64         `json:"online_ended_at,omitempty"`
+	OnlineBasis    string         `json:"online_basis"`
 	CreatedAt      int64          `json:"created_at"`
 	UpdatedAt      int64          `json:"updated_at"`
 	credentialJSON sql.NullString
@@ -168,6 +171,9 @@ type AccountPublic struct {
 	CredentialExpiresIn    int64   `json:"credential_expires_in,omitempty"`
 	RescanRecommended      bool    `json:"rescan_recommended"`
 	LastCheckedAt          *int64  `json:"last_checked_at"`
+	OnlineSince            *int64  `json:"online_since"`
+	OnlineEndedAt          *int64  `json:"online_ended_at"`
+	OnlineBasis            string  `json:"online_basis"`
 	CreatedAt              int64   `json:"created_at"`
 	UpdatedAt              int64   `json:"updated_at"`
 }
@@ -226,6 +232,10 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err = migrateAccountOnlineIntervals(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err = migrateAccountProxySettings(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -235,6 +245,11 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	out := &DB{sql: db}
+	for _, initialize := range []func(context.Context) error{out.EnsureAuthKeys, out.EnsureMerchant} {
+		if err = initialize(ctx); err != nil {
+			return nil, errors.Join(err, out.Close())
+		}
+	}
 	if err = out.EnsureDefaultFeatures(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -361,6 +376,37 @@ func migrateAccountRemark(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
+// Only add columns: old statuses and timestamps do not prove an online interval.
+func migrateAccountOnlineIntervals(ctx context.Context, db *sql.DB) error {
+	for _, column := range []struct{ name, definition string }{
+		{"online_since", "INTEGER"},
+		{"online_ended_at", "INTEGER"},
+		{"online_basis", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		exists, err := sqliteColumnExists(ctx, db, "wechat_accounts", column.name)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if _, err = db.ExecContext(ctx, "ALTER TABLE wechat_accounts ADD COLUMN "+column.name+" "+column.definition); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// These assignments run with the status write (and its CAS predicate, if any).
+// Unknown/session_only are inconclusive, so neither starts nor closes an interval.
+// A recovery after expiration starts a new observed interval, never bridges the gap.
+const accountOnlineIntervalSQL = `online_since=CASE WHEN ?='alive' AND (? OR online_since IS NULL OR online_ended_at IS NOT NULL) THEN ? ELSE online_since END,
+online_basis=CASE WHEN ?='alive' AND (? OR online_since IS NULL OR online_ended_at IS NOT NULL) THEN ? ELSE online_basis END,
+online_ended_at=CASE WHEN ?='alive' THEN NULL WHEN ?='expired' AND online_since IS NOT NULL THEN COALESCE(online_ended_at,?) ELSE online_ended_at END, `
+
+func onlineIntervalArgs(status, basis string, restart bool, now int64) []any {
+	return []any{status, restart, now, status, restart, basis, status, status, now}
+}
+
 func migrateAccountProxySettings(ctx context.Context, db *sql.DB) error {
 	columns := []struct {
 		name       string
@@ -433,12 +479,19 @@ func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, ali
 	// Reuse the lowest free account slot. This keeps a single account at ID 1
 	// after it is deleted and scanned again, while preserving existing IDs.
 	var existingID int64
-	err = tx.QueryRowContext(ctx, "SELECT id FROM wechat_accounts WHERE openid=?", openid).Scan(&existingID)
+	var existingBuffer string
+	var existingCredentials sql.NullString
+	intervalStatus := ""
+	if status != nil {
+		intervalStatus = *status
+	}
+	err = tx.QueryRowContext(ctx, "SELECT id, login_buffer, credentials FROM wechat_accounts WHERE openid=?", openid).Scan(&existingID, &existingBuffer, &existingCredentials)
 	if err == nil {
 		_, err = tx.ExecContext(ctx,
-			`UPDATE wechat_accounts SET login_buffer=?, alias=?, nickname=?, avatar=?, user_info=?, credentials=?, status=?, updated_at=? WHERE id=?`,
-			loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
-			userJSON, credJSON, nullableString(status), now, existingID,
+			`UPDATE wechat_accounts SET `+accountOnlineIntervalSQL+`login_buffer=?, alias=?, nickname=?, avatar=?, user_info=?, credentials=?, status=?, updated_at=? WHERE id=?`,
+			append(onlineIntervalArgs(intervalStatus, "login", existingBuffer != loginBuffer || existingCredentials != credJSON, now),
+				loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
+				userJSON, credJSON, nullableString(status), now, existingID)...,
 		)
 	} else if errors.Is(err, sql.ErrNoRows) {
 		rows, queryErr := tx.QueryContext(ctx, "SELECT id FROM wechat_accounts ORDER BY id")
@@ -466,12 +519,17 @@ func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, ali
 			return nil, queryErr
 		}
 		_ = rows.Close()
+		var onlineSince any
+		onlineBasis := ""
+		if intervalStatus == "alive" {
+			onlineSince, onlineBasis = now, "login"
+		}
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO wechat_accounts
-			(id, openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, created_at, updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			(id, openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, created_at, updated_at, online_since, online_basis)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			nextID, openid, loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
-			userJSON, credJSON, nullableString(status), now, now,
+			userJSON, credJSON, nullableString(status), now, now, onlineSince, onlineBasis,
 		)
 	} else {
 		return nil, err
@@ -667,6 +725,8 @@ func (db *DB) CompactAccountIDs(ctx context.Context) (map[int64]int64, error) {
 		{"account_push_settings", "account_id"},
 		{"account_proxy_settings", "account_id"},
 		{"account_links", "account_id"},
+		{"auth_key_accounts", "account_id"},
+		{"exclusive_account_owners", "account_id"},
 	}
 	for oldID := range mapping {
 		for _, child := range childTables {
@@ -769,8 +829,8 @@ func (db *DB) SetAccountCredentialStatus(ctx context.Context, id int64, loginBuf
 	}
 	now := time.Now().Unix()
 	_, err = db.sql.ExecContext(ctx,
-		"UPDATE wechat_accounts SET login_buffer=?, credentials=?, status=?, last_checked_at=?, updated_at=? WHERE id=?",
-		loginBuffer, credJSON, status, now, now, id,
+		"UPDATE wechat_accounts SET "+accountOnlineIntervalSQL+"login_buffer=?, credentials=?, status=?, last_checked_at=?, updated_at=? WHERE id=?",
+		append(onlineIntervalArgs(status, "observed", false, now), loginBuffer, credJSON, status, now, now, id)...,
 	)
 	return err
 }
@@ -801,9 +861,9 @@ func (db *DB) ApplyCredentialRefresh(ctx context.Context, expected *WechatAccoun
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx,
-		`UPDATE wechat_accounts SET login_buffer=?, credentials=?, status=?, last_checked_at=?, updated_at=?
+		`UPDATE wechat_accounts SET `+accountOnlineIntervalSQL+`login_buffer=?, credentials=?, status=?, last_checked_at=?, updated_at=?
 WHERE id=? AND openid=? AND credentials IS ? AND login_buffer=? AND status IS ?`,
-		loginBuffer, encoded, status, now, now, expected.ID, expected.OpenID, expected.credentialJSON, expected.LoginBuffer, nullableString(expected.Status))
+		append(onlineIntervalArgs(status, "observed", false, now), loginBuffer, encoded, status, now, now, expected.ID, expected.OpenID, expected.credentialJSON, expected.LoginBuffer, nullableString(expected.Status))...)
 	if err != nil {
 		return false, err
 	}
@@ -823,14 +883,14 @@ func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) err
 	now := time.Now().Unix()
 	if status == "expired" {
 		_, err := db.sql.ExecContext(ctx,
-			"UPDATE wechat_accounts SET login_buffer='', credentials=NULL, status=?, last_checked_at=?, updated_at=? WHERE id=?",
-			status, now, now, id,
+			"UPDATE wechat_accounts SET "+accountOnlineIntervalSQL+"login_buffer='', credentials=NULL, status=?, last_checked_at=?, updated_at=? WHERE id=?",
+			append(onlineIntervalArgs(status, "observed", false, now), status, now, now, id)...,
 		)
 		return err
 	}
 	_, err := db.sql.ExecContext(ctx,
-		"UPDATE wechat_accounts SET status=?, last_checked_at=?, updated_at=? WHERE id=?",
-		status, now, now, id,
+		"UPDATE wechat_accounts SET "+accountOnlineIntervalSQL+"status=?, last_checked_at=?, updated_at=? WHERE id=?",
+		append(onlineIntervalArgs(status, "observed", false, now), status, now, now, id)...,
 	)
 	return err
 }
@@ -1011,6 +1071,9 @@ func (a *WechatAccount) Public() AccountPublic {
 		CredentialExpiresIn:    credentialExpiresIn,
 		RescanRecommended:      rescanRecommended,
 		LastCheckedAt:          a.LastCheckedAt,
+		OnlineSince:            a.OnlineSince,
+		OnlineEndedAt:          a.OnlineEndedAt,
+		OnlineBasis:            a.OnlineBasis,
 		CreatedAt:              a.CreatedAt,
 		UpdatedAt:              a.UpdatedAt,
 	}
@@ -1037,7 +1100,7 @@ func int64Credential(values map[string]any, key string) int64 {
 	}
 }
 
-const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, remark, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at FROM wechat_accounts`
+const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, remark, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at, online_since, online_ended_at, online_basis FROM wechat_accounts`
 
 type accountScanner interface {
 	Scan(dest ...any) error
@@ -1053,15 +1116,16 @@ func (db *DB) scanAccount(row accountScanner) (*WechatAccount, error) {
 
 func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	var (
-		a                               WechatAccount
-		uin, lastChecked                sql.NullInt64
-		alias, nickname, remark, avatar sql.NullString
-		userJSON, credJSON              sql.NullString
-		status                          sql.NullString
+		a                                            WechatAccount
+		uin, lastChecked, onlineSince, onlineEndedAt sql.NullInt64
+		alias, nickname, remark, avatar              sql.NullString
+		userJSON, credJSON                           sql.NullString
+		status                                       sql.NullString
 	)
 	err := row.Scan(
 		&a.ID, &a.OpenID, &uin, &alias, &nickname, &remark, &avatar, &userJSON,
 		&a.LoginBuffer, &credJSON, &status, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
+		&onlineSince, &onlineEndedAt, &a.OnlineBasis,
 	)
 	if err != nil {
 		return nil, err
@@ -1074,6 +1138,12 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	a.Remark = stringPtrFromNull(remark)
 	a.Avatar = stringPtrFromNull(avatar)
 	a.Status = stringPtrFromNull(status)
+	if onlineSince.Valid {
+		a.OnlineSince = &onlineSince.Int64
+	}
+	if onlineEndedAt.Valid {
+		a.OnlineEndedAt = &onlineEndedAt.Int64
+	}
 	if lastChecked.Valid {
 		a.LastCheckedAt = &lastChecked.Int64
 	}

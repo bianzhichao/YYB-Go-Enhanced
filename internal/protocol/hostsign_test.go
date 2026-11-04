@@ -8,6 +8,7 @@ import (
 
 func TestNormalizeHostSignPayloadForms(t *testing.T) {
 	valid := []map[string]any{
+		{"Data": `{"plugins":[{"provider":"wx1234567890abcdef","inner_version":1}]}`},
 		{"data": map[string]any{"plugins": []map[string]any{{"provider": "wx1234567890abcdef", "inner_version": 1}}}},
 		{"plugins": []map[string]any{{"provider": "wx1234567890abcdef", "inner_version": 3}}},
 		{"provider": "wx1234567890abcdef", "inner_version": 2},
@@ -100,5 +101,3 @@ func TestHostSignDeepInputTerminates(t *testing.T) {
 		t.Fatal("expected error for non-JSON deep payload")
 	}
 }
-
-

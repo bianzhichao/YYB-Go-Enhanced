@@ -1414,6 +1414,19 @@
       return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
     }
 
+    function onlineIntervalMarkup(account) {
+      const timestamp = value => {
+        const seconds = Number(value);
+        if (!Number.isFinite(seconds) || seconds <= 0) return null;
+        const date = new Date(seconds * 1000);
+        return Number.isFinite(date.getTime()) ? escapeHTML(date.toLocaleString("zh-CN", { hour12: false })) : null;
+      };
+      const start = timestamp(account.online_since);
+      const end = timestamp(account.online_ended_at);
+      const basis = !start ? "未知" : account.online_basis === "login" ? "扫码登录" : account.online_basis === "observed" ? "成功状态观测" : "未知";
+      return `<span class="account-meta" title="最近一次记录的区间；未记录结束不代表持续在线。">观测开始：${start || "未知"} · 起点依据：${basis}</span>
+        <span class="account-meta">观测结束：${end || "未记录"}</span>`;
+    }
     function lifecycleDuration(seconds) {
       if (!Number.isFinite(seconds)) return "未记录";
       if (seconds <= 0) return "已到期";
@@ -1582,6 +1595,7 @@
             </span>
             <span class="account-meta" title="最后检查 ${formatChecked(account.last_checked_at)}">ID ${escapeHTML(number)} · ${escapeHTML(proxy)}${!isExpired && state.proxyConfigs.get(String(account.id))?.keepalive_supported === false ? " · 不可保活" : ""}</span>
             <span class="account-openid" title="OpenID: ${escapeHTML(account.openid)}">OpenID: ${escapeHTML(account.openid)}</span>
+            ${onlineIntervalMarkup(account)}
           </span>
           ${lifecycleMarkup(account)}
           <span class="account-row-actions"><button type="button" class="btn secondary" data-update-account aria-label="更新 ${escapeHTML(name)} 的扫码">更新</button><a class="btn" href="/proxies?ref=${encodeURIComponent(account.id)}" aria-label="管理 ${escapeHTML(name)} 的代理">代理</a></span>

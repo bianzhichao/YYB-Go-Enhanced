@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -389,6 +388,23 @@ func (a *App) Handler() http.Handler {
 	protocolRoutes.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	protocolRoutes.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
 	protocolRoutes.Any("/wxapp/getHostSign", gin.WrapF(a.handleGetHostSign))
+	protocolRoutes.Any("/Wxapp/GetHostSign", gin.WrapF(a.handleGetHostSign))
+	protocolRoutes.Any("/api/Wxapp/GetHostSign", gin.WrapF(a.handleGetHostSign))
+	protocolRoutes.Any("/wxapp/checkShortUrl", gin.WrapF(a.handleCheckShortUrl))
+	protocolRoutes.Any("/wxapp/wxaAttrSync", gin.WrapF(a.handleWxaAttrSync))
+	protocolRoutes.Any("/wxapp/wxaAppSync", gin.WrapF(a.handleWxaAppSync))
+	protocolRoutes.Any("/wxapp/getWxaCDNDownloadUrl", gin.WrapF(a.handleGetWxaCDNDownloadUrl))
+	protocolRoutes.Any("/wxapp/gatewayv3", gin.WrapF(a.handleGatewayProxy))
+	protocolRoutes.Any("/wx/gatewayv3", gin.WrapF(a.handleGatewayProxy))
+	protocolRoutes.Any("/wxapp/getAllPhone", gin.WrapF(a.handleGetAllPhone))
+	protocolRoutes.Any("/wx/getallphonenumber", gin.WrapF(a.handleGetAllPhone))
+	protocolRoutes.Any("/wxapp/getRuntimeSession", gin.WrapF(a.handleGetRuntimeSession))
+	protocolRoutes.Any("/Wxapp/JSGetSessionid", gin.WrapF(a.handleGetRuntimeSession))
+	protocolRoutes.Any("/api/Wxapp/JSGetSessionid", gin.WrapF(a.handleGetRuntimeSession))
+	protocolRoutes.Any("/wxapp/getPayQRCode", gin.WrapF(a.handleGetPayQRCode))
+	protocolRoutes.Any("/wxapp/getWxaCode", gin.WrapF(a.handleGetWxaCode))
+	protocolRoutes.Any("/wxapp/getA8Key", gin.WrapF(a.handleGetA8Key))
+	protocolRoutes.Any("/wxapp/userRollList", gin.WrapF(a.handleUserRollList))
 	protocolRoutes.Any("/wx/code", gin.WrapF(a.handleWXCodeAlias))
 	protocolRoutes.Any("/wx/getuserinfo", gin.WrapF(a.handleWXGetUserInfo))
 	protocolRoutes.Any("/wx/encryptkey", gin.WrapF(a.handleWXEncryptKey))
@@ -413,6 +429,21 @@ func (a *App) Handler() http.Handler {
 	router.Any("/account-link/:token/*path", gin.WrapF(a.handleAccountLink))
 
 	router.Use(a.requireBrowserSession())
+	router.Any("/auth/keys", gin.WrapF(a.handleAuthKeys))
+	router.Any("/merchant", gin.WrapF(a.handleMerchantPage))
+	router.Any("/api/merchant/bills", gin.WrapF(a.handleMerchantBills))
+	router.Any("/api/merchant/users", gin.WrapF(a.handleMerchantUsers))
+	router.Any("/api/merchant/bills/insert", gin.WrapF(a.handleMerchantInsertBill))
+	router.Any("/api/merchant/bills/confirm", gin.WrapF(a.handleMerchantBillsConfirm))
+	router.Any("/api/merchant/bills/delete", gin.WrapF(a.handleMerchantDeleteBill))
+	router.Any("/api/merchant/bills/fail", gin.WrapF(a.handleMerchantBillFail))
+	router.Any("/api/merchant/bills/cleanup", gin.WrapF(a.handleMerchantBillsCleanup))
+	router.Any("/wx/bills", gin.WrapF(a.handleMerchantBills))
+	router.Any("/wx/bills/confirm", gin.WrapF(a.handleMerchantBillsConfirm))
+	router.Any("/wx/bills/insert", gin.WrapF(a.handleMerchantInsertBill))
+	router.Any("/wx/bills/delete", gin.WrapF(a.handleMerchantDeleteBill))
+	router.Any("/wx/bills/fail", gin.WrapF(a.handleMerchantBillFail))
+	router.Any("/wx/bills/cleanup", gin.WrapF(a.handleMerchantBillsCleanup))
 	router.Any("/settings", gin.WrapF(a.handleSettingsPage))
 	router.Any("/users", gin.WrapF(a.handleUsersPage))
 	router.Any("/api/auth/me", gin.WrapF(a.handleAuthMe))
@@ -1095,7 +1126,9 @@ type wxappRequest struct {
 
 type wxappCall func(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error)
 
-func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload bool, call wxappCall) {
+type wxappValidator func(appID string, payload map[string]any) error
+
+func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload bool, call wxappCall, validators ...wxappValidator) {
 	if !a.authorizeProtocol(w, r) {
 		return
 	}
@@ -1115,6 +1148,12 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 	if requirePayload && body.Payload == nil {
 		writeError(w, http.StatusBadRequest, "payload is required")
 		return
+	}
+	for _, validate := range validators {
+		if err := validate(body.AppID, body.Payload); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	acc, ok := a.resolveAccountRef(w, r, body.Ref)
 	if !ok {
@@ -1149,16 +1188,7 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 // every automation request must carry the token; this prevents a public
 // YYB_SERVER address plus a numeric account id from being abused by scanners.
 func (a *App) authorizeProtocol(w http.ResponseWriter, r *http.Request) bool {
-	expected := strings.TrimSpace(a.cfg.ProtocolToken)
-	if expected == "" {
-		return true
-	}
-	provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
-		writeError(w, http.StatusUnauthorized, "invalid protocol token")
-		return false
-	}
-	return true
+	return a.authorizeProtocolKey(w, r)
 }
 
 func decodeOptionalJSON(r *http.Request, dst any) error {
@@ -1217,6 +1247,9 @@ func (a *App) browserUser(r *http.Request) *auth.User {
 }
 
 func (a *App) accountVisible(r *http.Request, accountID int64) bool {
+	if !a.scopedAccountAllowed(r, accountID) {
+		return false
+	}
 	user := a.browserUser(r)
 	if a.auth == nil || user == nil || user.Role == "admin" {
 		return true
@@ -1227,8 +1260,18 @@ func (a *App) accountVisible(r *http.Request, accountID int64) bool {
 
 func (a *App) visibleAccounts(r *http.Request) ([]*store.WechatAccount, error) {
 	accounts, err := a.db.ListAccounts(r.Context())
-	if err != nil || a.auth == nil {
+	if err != nil {
 		return accounts, err
+	}
+	visible := make([]*store.WechatAccount, 0, len(accounts))
+	for _, account := range accounts {
+		if a.scopedAccountAllowed(r, account.ID) {
+			visible = append(visible, account)
+		}
+	}
+	accounts = visible
+	if a.auth == nil {
+		return accounts, nil
 	}
 	user := a.browserUser(r)
 	if user == nil || user.Role == "admin" {
@@ -1433,6 +1476,9 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	a.recordCircuitOutcome(acc, appID, op, callErr)
 	if callErr == nil {
 		return result, nil
+	}
+	if protocol.IsNoRetry(callErr) {
+		return nil, callErr
 	}
 	current, snapshotErr := a.db.GetAccount(ctx, acc.ID)
 	if errors.Is(callErr, store.ErrAccountAuthorizationChanged) || errors.Is(callErr, store.ErrSessionChanged) || snapshotErr == nil && !current.SameAuthorization(acc) {

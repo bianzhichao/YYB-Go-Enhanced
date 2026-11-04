@@ -10,6 +10,7 @@ import (
 )
 
 var ErrMergeSourceHasJobs = errors.New("source account has managed jobs; remove them before merging")
+var ErrMergeAPIKeyBindings = errors.New("cannot merge accounts with API key bindings")
 
 // MergeAccountAuthorization repairs an accidental extra account. The selected
 // target keeps its ID and configuration; only the source authorization moves.
@@ -27,6 +28,15 @@ func (db *DB) MergeAccountAuthorization(ctx context.Context, source, target *Wec
 		return nil, err
 	}
 	defer tx.Rollback()
+	// Replacing the target identity must not transfer an existing API grant to
+	// another person or silently discard an exclusive source owner.
+	var keyBindings int
+	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM auth_key_accounts WHERE account_id IN (?,?)", source.ID, target.ID).Scan(&keyBindings); err != nil {
+		return nil, err
+	}
+	if keyBindings > 0 {
+		return nil, ErrMergeAPIKeyBindings
+	}
 	for _, snapshot := range []*WechatAccount{source, target} {
 		current, err := scanAccountRows(tx.QueryRowContext(ctx, selectAccountSQL+" WHERE id=?", snapshot.ID))
 		if errors.Is(err, sql.ErrNoRows) {
@@ -37,6 +47,10 @@ func (db *DB) MergeAccountAuthorization(ctx context.Context, source, target *Wec
 		}
 		if !current.SameAuthorization(snapshot) || current.LoginBuffer != snapshot.LoginBuffer {
 			return nil, ErrAccountAuthorizationChanged
+		}
+		if current.ID == source.ID {
+			// Use the transactional observation, not an older caller snapshot.
+			source = current
 		}
 	}
 	if source.LoginBuffer == "" || len(source.Credentials) == 0 || source.Status != nil && *source.Status == "expired" {
@@ -64,12 +78,14 @@ func (db *DB) MergeAccountAuthorization(ctx context.Context, source, target *Wec
 			refs = append(refs, old...)
 		}
 	}
+	// Move only the source identity's recorded interval. A merge is not a login
+	// or an online observation, so unknown source history stays unknown.
 	// Deleting source first releases its unique OpenID inside the same transaction.
 	if _, err = tx.ExecContext(ctx, "DELETE FROM wechat_accounts WHERE id=?", source.ID); err != nil {
 		return nil, err
 	}
 	now := time.Now().Unix()
-	_, err = tx.ExecContext(ctx, `UPDATE wechat_accounts SET openid=?,login_buffer=?,credentials=?,nickname=?,alias=?,avatar=?,user_info=?,uin=NULL,status='alive',last_checked_at=?,updated_at=? WHERE id=?`, source.OpenID, source.LoginBuffer, source.credentialJSON, nullableString(source.Nickname), nullableString(source.Alias), nullableString(source.Avatar), userJSON, now, now, target.ID)
+	_, err = tx.ExecContext(ctx, `UPDATE wechat_accounts SET openid=?,login_buffer=?,credentials=?,nickname=?,alias=?,avatar=?,user_info=?,uin=NULL,status='alive',online_since=?,online_ended_at=?,online_basis=?,last_checked_at=?,updated_at=? WHERE id=?`, source.OpenID, source.LoginBuffer, source.credentialJSON, nullableString(source.Nickname), nullableString(source.Alias), nullableString(source.Avatar), userJSON, nullableInt(source.OnlineSince), nullableInt(source.OnlineEndedAt), source.OnlineBasis, now, now, target.ID)
 	if err != nil {
 		return nil, err
 	}

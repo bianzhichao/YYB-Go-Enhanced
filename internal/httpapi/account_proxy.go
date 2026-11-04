@@ -264,6 +264,9 @@ func (a *App) resolveProxySpec(ctx context.Context, spec proxysource.Spec) (stri
 // Protocol calls can explicitly use direct egress without extracting a proxy.
 // QR login, profile queries and credential refresh keep using resolveAccountProxy.
 func (a *App) resolveWXAppProxy(ctx context.Context, accountID int64) (string, bool, error) {
+	if err := a.checkScopedProxy(ctx, accountID); err != nil {
+		return "", false, err
+	}
 	setting, err := a.db.GetAccountProxySetting(ctx, accountID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", false, err
@@ -275,6 +278,9 @@ func (a *App) resolveWXAppProxy(ctx context.Context, accountID int64) (string, b
 }
 
 func (a *App) resolveAccountProxy(ctx context.Context, accountID int64) (string, bool, error) {
+	if err := a.checkScopedAccountProxy(ctx, accountID); err != nil {
+		return "", false, err
+	}
 	setting, err := a.db.GetAccountProxySetting(ctx, accountID)
 	if errors.Is(err, sql.ErrNoRows) {
 		if strings.TrimSpace(a.cfg.TCPProxy) == "" {

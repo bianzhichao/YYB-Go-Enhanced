@@ -71,7 +71,7 @@ AND l.used_at IS NULL AND l.revoked_at IS NULL AND l.expires_at>?`, link.ID, lin
 		}
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE wechat_accounts SET openid=?,login_buffer=?,credentials=?,nickname=?,alias=?,avatar=?,user_info=?,
-uin=NULL,status='alive',last_checked_at=?,updated_at=? WHERE id=?`, openID, buffer, credJSON, nullableString(nickname), nullableString(nickname), nullableString(avatar), userJSON, now, now, link.AccountID)
+uin=NULL,status='alive',online_since=?,online_ended_at=NULL,online_basis='login',last_checked_at=?,updated_at=? WHERE id=?`, openID, buffer, credJSON, nullableString(nickname), nullableString(nickname), nullableString(avatar), userJSON, now, now, now, link.AccountID)
 	if err != nil {
 		return nil, err
 	}

@@ -14,7 +14,7 @@ import (
 )
 
 // VerifyPlugin uses the existing authenticated transfer/session transport.
-// Wire layout checked against luotron/yyb_go internal/protocol/hostsign.go.
+// Wire layout ported from the local reference implementation.
 const hostSignCommand = 1714
 
 var hostSignProvider = regexp.MustCompile(`^wx[A-Za-z0-9]{16}$`)
@@ -27,6 +27,8 @@ func NormalizeHostSignPayload(payload map[string]any) ([]byte, error) {
 	}
 	value := any(payload)
 	if v, ok := payload["data"]; ok {
+		value = v
+	} else if v, ok := payload["Data"]; ok {
 		value = v
 	}
 	var raw []byte
@@ -95,7 +97,7 @@ func (p *Pool) GetHostSign(ctx context.Context, loginBuffer, appID string, paylo
 		return nil, err
 	}
 	return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
-		plain, err := buildHostSignRequest(st.Session.UIN, appID, data, st.Session.HostAppID, nil)
+		plain, err := buildHostSignRequest(st.Session.UIN, appID, data, st.Session.HostAppID, st.Device.SessDevice)
 		if err != nil {
 			return nil, err
 		}
@@ -107,7 +109,8 @@ func (p *Pool) GetHostSign(ctx context.Context, loginBuffer, appID string, paylo
 		if err != nil {
 			return nil, err
 		}
-		return parseHostSignResponse(extracted, response)
+		result, err := parseHostSignResponse(extracted, response)
+		return result, MarkNoRetry(err)
 	}, expected...)
 }
 

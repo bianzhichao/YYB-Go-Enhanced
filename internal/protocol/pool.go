@@ -280,7 +280,7 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	if err == nil {
 		st.FallbackDirect = fallbackDirect
 		res, err := op(ctx, st)
-		if err == nil || tcpProxy == "" || !fallbackDirect || IsApplicationRequestRejection(err) || st.CachedOnly {
+		if err == nil || tcpProxy == "" || !fallbackDirect || IsApplicationRequestRejection(err) || IsNoRetry(err) || st.CachedOnly {
 			return res, err
 		}
 		_ = p.invalidateExpected(ctx, accountID, tcpProxy, expected...)

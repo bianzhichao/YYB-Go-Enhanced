@@ -822,6 +822,7 @@ func newOpenAPISpec() map[string]any {
 	}
 	// Scope Swagger's Authorization header to the same protocol endpoints as
 	// the router gate, without leaking it to management or public operations.
+	addPortedOpenAPI(spec)
 	for path, item := range spec["paths"].(map[string]any) {
 		if !strings.HasPrefix(path, "/wx/") && !strings.HasPrefix(path, "/wxapp/") {
 			continue

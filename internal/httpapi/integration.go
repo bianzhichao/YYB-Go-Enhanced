@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"errors"
@@ -205,6 +206,12 @@ func (a *App) authorizeIntegration(w http.ResponseWriter, r *http.Request) bool 
 		writeError(w, http.StatusUnauthorized, "invalid integration token")
 		return false
 	}
+	owners, err := a.db.ExclusiveAccountOwners(r.Context())
+	if err != nil {
+		writeError(w, 500, "protocol ACL unavailable")
+		return false
+	}
+	*r = *r.WithContext(context.WithValue(r.Context(), scopedProtocolContext{}, scopedProtocolPrincipal{Owners: owners}))
 	return true
 }
 
