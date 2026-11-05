@@ -81,7 +81,7 @@ func (db *DB) MergeAccountAuthorization(ctx context.Context, source, target *Wec
 	// Move only the source identity's recorded interval. A merge is not a login
 	// or an online observation, so unknown source history stays unknown.
 	// Deleting source first releases its unique OpenID inside the same transaction.
-	if _, err = tx.ExecContext(ctx, "DELETE FROM wechat_accounts WHERE id=?", source.ID); err != nil {
+	if _, err = deleteAccountRow(ctx, tx, source.ID); err != nil {
 		return nil, err
 	}
 	now := time.Now().Unix()

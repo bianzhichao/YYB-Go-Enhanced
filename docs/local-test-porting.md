@@ -98,3 +98,13 @@
 H5 授权发送后的错误标记为 NoRetry；业务报文仅发送到一个 ShortLink 目标，禁止直连回退和跨目标重发。发送前的凭据获取策略保留。新增本地模拟覆盖响应丢失与畸形响应：各发送一次，不失效已有代理 session。此前未完成的进程级发送注入已移除，测试注入仅作用单个 Pool。
 
 最终修复后 `go test ./...`、`go build ./...`、`go vet ./...`、`git diff --check` 全部退出 0；`python -B -m unittest discover -s tests -p test_website_appid_scripts.py` 的 3 项离线测试通过。未进行真实账号、扫码、支付或部署验证。
+
+## 2026-11-05 上游 v0.2.79 同步
+
+同步前维护提交 `6881b09fb6f1fcd1a2699311b791d777ca2872c2`；固定上游 `151bf1eda77abbeb4135b8a94f2e0e6efd9ea9e4`。合入本轮 5 个提交，包括运行参数面板、多渠道扫码、账号组合及面板代表同步。保留维护的专用微信接口、scoped Key/独占账号、扫码归属、代理、在线区间、账单、H5 单次发送和实例级 fleet 调度状态。
+
+文本冲突位于 app.go 的扫码确认：保留维护方 saveScannedAccount 与 scoped enrollment 检查，同时采用上游 skipAutoSync/defer_panel_sync 行为。源码回读确认账号合并的 ErrMergeAPIKeyBindings 防护、编号整理的 Key/独占关系重映射均保留。按大小写敏感的显式唯一路径统计，维护 123 条、上游 89 条、合并 127 条，两边路径均无丢失；兼容别名与管理路径包含在计数内。
+
+交叉审查后修复：fleet 状态查询逐成员检查账号可见性，对含隐藏成员的历史组返回 403，避免披露其他归属的成员资料；runtime settings 在 Reset、文件写入及内存修改前校验全部现有限制字段，非法请求不产生部分修改。新增 sync_v079_test.go 覆盖 scoped Key/浏览器成员隔离和非法请求保留配置及黑名单状态。
+
+验证：多渠道页面使用独立本机服务、SQLite seed 数据与 mock QR，node tests/multi-channel-ui.cjs 输出 multi-channel scan UI ok，退出 0；两项补修有定向回归。最终 `go test ./...`、`go build ./...`、`go vet ./...` 与 `git diff --check` 均退出 0。未调用真实账号、真实扫码、支付或部署。临时 UI 服务和数据已清理。
