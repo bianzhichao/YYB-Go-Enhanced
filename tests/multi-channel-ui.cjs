@@ -30,7 +30,7 @@ async function fresh(browser) {
   return {context, page, errors};
 }
 
-const accountsOf = async context => (await (await context.request.get(base + '/accounts')).json()).data;
+const accountsOf = async context => (await (await context.request.get(base + '/accounts?include_members=1')).json()).data;
 const byId = (list, id) => list.find(account => account.id === id);
 
 // The seeded account ids by name, found through their openid.
@@ -115,6 +115,9 @@ async function resetFleets(browser) {
 (async () => {
   const browser = await chromium.launch({headless: true, ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
   try {
+    const registrySession = await fresh(browser);
+    const channelIDs = (await (await registrySession.context.request.get(base + "/api/scan-channels")).json()).data.channels.map(c => c.id);
+    await registrySession.context.close();
     await resetFleets(browser);
     // The channel list the scan page uses is the server's list; a new account is built
     // from one QR per channel, the first scan becoming the primary.
@@ -172,7 +175,9 @@ async function resetFleets(browser) {
 
       // Switching off returns to the single flow, with a new QR of its own.
       const before = qr.requested.length;
+      const singleQR = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === '/qr');
       await page.locator('.multi-switch').click();
+      await singleQR;
       await page.waitForFunction(() => !document.getElementById('multiPane').offsetParent);
       await page.waitForFunction(() => document.querySelector('#qrWrap img'));
       assert.equal(qr.requested.length, before + 1);
@@ -194,8 +199,8 @@ async function resetFleets(browser) {
       });
       await page.goto(base + '/scan', {waitUntil: 'domcontentloaded'});
       await page.locator('.multi-switch').click();
-      await waiting(page, 3);
-      assert.deepEqual([...qr.requested].sort(), ['appstore', 'gameassist', 'pcmgr']);
+      await waiting(page, channelIDs.length);
+      assert.deepEqual([...qr.requested].sort(), [...channelIDs].sort());
       assert.equal(await page.locator('#qrPane').isVisible(), false);
       assert.deepEqual(errors, []);
       await context.close();
@@ -208,14 +213,14 @@ async function resetFleets(browser) {
       await page.goto(base + '/scan');
       await page.waitForFunction(() => document.querySelector('#qrWrap img'));
       await page.locator('.multi-switch').click();
-      await waiting(page, 3);
+      await waiting(page, channelIDs.length);
       qr.requested.length = 0;
       await page.reload();
-      await waiting(page, 3);
+      await waiting(page, channelIDs.length);
       assert.equal(await page.locator('#multiScanSwitch').isChecked(), true);
-      assert.equal(qr.requested.length, 3, 'one QR per channel and none for the single flow');
+      assert.equal(qr.requested.length, channelIDs.length, 'one QR per channel and none for the single flow');
       await page.goto(base + '/scan?multi=1');
-      await waiting(page, 3);
+      await waiting(page, channelIDs.length);
       assert.deepEqual(errors, []);
       await context.close();
     }
@@ -227,7 +232,7 @@ async function resetFleets(browser) {
       const alice = S.alice[0], carol = S.carol[0];
       const qr = await mockQR(context, await withAccounts(context, [['appstore', alice], ['pcmgr', carol]]));
       await page.goto(base + '/scan?multi=1');
-      await waiting(page, 3);
+      await waiting(page, channelIDs.length);
       qr.scan('appstore');
       await done(page, 'appstore');
       qr.scan('pcmgr');
@@ -261,7 +266,7 @@ async function resetFleets(browser) {
       const [first, second] = S.dave;
       const qr = await mockQR(context, await withAccounts(context, [['appstore', first], ['pcmgr', second]]));
       await page.goto(base + '/scan?multi=1');
-      await waiting(page, 3);
+      await waiting(page, channelIDs.length);
       qr.scan('appstore');
       await done(page, 'appstore');
       qr.scan('pcmgr');
@@ -285,7 +290,9 @@ async function resetFleets(browser) {
       assert.equal(await page.locator('.multi-card[data-state="bound"]').count(), 3);
       assert.equal(await page.locator('#multiScanSwitch').isDisabled(), true);
       assert.equal(await page.locator('#multiScanSwitch').isChecked(), true);
-      assert.equal(qr.requested.length, 0, 'every channel is bound: no QR');
+      await waiting(page, channelIDs.length - 3);
+      assert.deepEqual([...qr.requested].sort(), channelIDs.filter(id => !['appstore', 'pcmgr', 'gameassist'].includes(id)).sort());
+      qr.requested.length = 0;
       assert.equal(await page.locator('.multi-member').count(), 3);
       assert.match(await member(page, boomApp).locator('small').innerText(), /主账号/);
       await shot(page, 'scan-multi-supplement-full');
@@ -305,8 +312,8 @@ async function resetFleets(browser) {
       const [appstore, pcmgr, gameassist] = S.alice;
       const qr = await mockQR(context, await withAccounts(context, [['pcmgr', pcmgr], ['gameassist', gameassist]]));
       await page.goto(base + '/scan?ref=' + appstore);
-      await waiting(page, 2);
-      assert.deepEqual(qr.requested.sort(), ['gameassist', 'pcmgr']);
+      await waiting(page, channelIDs.length - 1);
+      assert.deepEqual(qr.requested.sort(), channelIDs.filter(id => id !== 'appstore').sort());
       assert.equal(await page.locator('.multi-card[data-product="appstore"][data-state="bound"]').count(), 1);
       assert.match(await page.locator('#multiBase').innerText(), /补扫渠道/);
       assert.equal(await page.locator('#accountId').innerText(), String(appstore));
@@ -493,8 +500,8 @@ async function resetFleets(browser) {
       const fleet = page.locator(`.account-card.fleet[data-fleet="${S.boom[0]}"]`);
       await fleet.waitFor();
       await page.waitForFunction(id => document.querySelector(`.account-card.fleet[data-fleet="${id}"] .channel-chip.missing`), S.boom[0]);
-      assert.equal(await fleet.locator('.channel-chip.missing').count(), 1);
-      assert.match(await fleet.locator('.channel-chip.missing').getAttribute('href'), new RegExp(`/scan\\?ref=${S.boom[0]}$`));
+      assert.equal(await fleet.locator('.channel-chip.missing').count(), registry.length + 1 - 3);
+      assert.match(await fleet.locator('.channel-chip.missing').first().getAttribute('href'), new RegExp(`/scan\\?ref=${S.boom[0]}$`));
       assert.equal(await page.locator('#accountLinkProduct option').count(), registry.length + 1);
       assert.deepEqual(errors.filter(message => !/avatar|404/.test(message)), []);
       await context.close();

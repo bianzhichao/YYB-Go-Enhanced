@@ -1,0 +1,111 @@
+package httpapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"yyb_go/internal/eventlog"
+	"yyb_go/internal/protocol"
+	"yyb_go/internal/qbbrowser"
+)
+
+// QQ Browser token push: the companion extension (extensions/qbbrowser-token)
+// calls chrome.account / browser.login inside QQ Browser and posts the outer
+// access token here. The server exchanges it for an ilink login buffer and
+// keeps the account's credentials current — no QR scan involved, the browser
+// sign-in IS the authorization.
+
+type qbTokenPush struct {
+	AccessToken string `json:"access_token"`
+	UserID      string `json:"user_id"`
+	GUID        string `json:"guid"`
+	Nickname    string `json:"nickname"`
+}
+
+func (a *App) handleQBBrowserToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body qbTokenPush
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	creds := qbbrowser.Credentials{
+		QBAccessToken: strings.TrimSpace(body.AccessToken),
+		UserID:        strings.TrimSpace(body.UserID),
+		GUID:          strings.TrimSpace(body.GUID),
+		Nickname:      strings.TrimSpace(body.Nickname),
+	}
+	if err := creds.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	enrollment, err := a.prepareScopedEnrollment(w, r, nil)
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if err := a.ensureScannedAccountAllowed(r, creds.Identity()); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	scanCtx, err := a.scopedScanContext(w, r, enrollment)
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	existed, err := a.accountExistsBeforeScan(scanCtx, creds.Identity())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(scanCtx, a.cfg.RequestTimeout)
+	defer cancel()
+	// Validate the token against the buffer gateway before touching the store:
+	// the extension learns immediately when its token is stale.
+	buffer, err := qbbrowser.FetchBuffer(ctx, a.qr.LoginBuffers().HTTPClient(), creds)
+	if err != nil {
+		var rejected *qbbrowser.TokenRejectedError
+		if errors.As(err, &rejected) {
+			writeError(w, http.StatusUnauthorized, fmt.Sprintf("token 被网关拒绝（code=%d），请在 QQ 浏览器重新登录微信", rejected.Code))
+			return
+		}
+		writeError(w, http.StatusBadGateway, "登录票据换取失败: "+err.Error())
+		return
+	}
+	openID := creds.Identity()
+	status := "alive"
+	credMap := protocol.LoginBufferCredentials{
+		Provider: "qbbrowser", OpenID: openID,
+		QBBrowser:              creds,
+		LoginType:              "WX",
+		ExpiresAt:              time.Now().Unix() + 86400,
+		ExpiresIn:              86400,
+		RefreshTokenObservedAt: time.Now().Unix(),
+	}.ToMap()
+	acc, err := a.saveScannedAccount(ctx, openID, buffer, nil, nil, nil, nil, credMap, &status)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
+		return
+	}
+	if enrollment.CreatorKeyID == 0 {
+		if err := a.claimScannedAccount(r, acc.ID); err != nil {
+			if !existed {
+				_ = a.db.DeleteAccount(ctx, acc.ID)
+			}
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+	}
+	a.invalidateProxyLease(acc.ID)
+	a.clearKeepAliveRetry(acc.ID)
+	a.circuit.forget(acc.ID)
+	a.events.Emit("management.completed", eventlog.Fields{Route: "/api/qbbrowser/token", Method: http.MethodPost})
+	writeJSON(w, http.StatusOK, acc.Public())
+}

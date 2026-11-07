@@ -289,7 +289,7 @@ func NewApp(cfg Config) (*App, error) {
 		qinglong:           newQingLongClient(cfg.QingLongType, cfg.QingLongURL, cfg.QingLongClientID, cfg.QingLongSecret, cfg.RequestTimeout),
 		notifier:           newOfflineNotifier(offlineNotifyTimeout),
 		circuit:            newCircuitBreaker(circuitConfigFor(cfg.DisableCircuitBreaker)),
-		appIDs:             newAppIDPolicy(cfg.CodeDenyAppIDs, cfg.CodeAllowAppIDs),
+		appIDs:             newAppIDPolicy(cfg.CodeDenyAppIDs, cfg.CodeAllowAppIDs, db),
 		dynamicAppIDs:      newDynamicAppIDDeny(db, cfg.CodeDynamicDenyThreshold, cfg.CodeAllowAppIDs, cfg.DisableDynamicAppIDDeny),
 		pacer:              newAccountPacer(filepath.Join(res.DB, "tuning.json"), trafficSettings),
 		qrSessions:         map[string]*qrLoginSession{},
@@ -401,6 +401,7 @@ func (a *App) Handler() http.Handler {
 		c.Next()
 	})
 	protocolRoutes.Any("/wx/oauth", gin.WrapF(a.handlePublicOAuth))
+	protocolRoutes.Any("/api/qbbrowser/token", gin.WrapF(a.handleQBBrowserToken))
 	protocolRoutes.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
 	protocolRoutes.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	protocolRoutes.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
@@ -842,6 +843,10 @@ func (a *App) handleAccountsRoot(w http.ResponseWriter, r *http.Request) {
 		accounts, err := a.visibleAccounts(r)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		accounts, ok := accountListForRequest(w, r, accounts)
+		if !ok {
 			return
 		}
 		out := make([]store.AccountPublic, 0, len(accounts))

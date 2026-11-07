@@ -117,12 +117,20 @@ CREATE TABLE IF NOT EXISTS account_links (
     token_ciphertext TEXT   NOT NULL DEFAULT '',
     target_product TEXT    NOT NULL DEFAULT '',
     switch_confirmed INTEGER NOT NULL DEFAULT 0,
+    allow_multi_channel INTEGER NOT NULL DEFAULT 0,
+    multi_primary_id INTEGER REFERENCES wechat_accounts(id) ON DELETE CASCADE,
     expires_at      INTEGER NOT NULL,
     used_at         INTEGER,
     revoked_at      INTEGER,
     created_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_account_links_expires ON account_links(expires_at);
+CREATE TABLE IF NOT EXISTS account_link_scans (
+    link_id INTEGER NOT NULL REFERENCES account_links(id) ON DELETE CASCADE,
+    product TEXT NOT NULL,
+    account_id INTEGER NOT NULL REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    PRIMARY KEY(link_id, product)
+);
 `
 
 var defaultFeatures = []Feature{
@@ -269,6 +277,8 @@ func migrateAccountLinks(ctx context.Context, db *sql.DB) error {
 		{"revoked_at", "INTEGER"},
 		{"target_product", "TEXT NOT NULL DEFAULT ''"},
 		{"switch_confirmed", "INTEGER NOT NULL DEFAULT 0"},
+		{"allow_multi_channel", "INTEGER NOT NULL DEFAULT 0"},
+		{"multi_primary_id", "INTEGER REFERENCES wechat_accounts(id) ON DELETE CASCADE"},
 	} {
 		exists, err := sqliteColumnExists(ctx, db, "account_links", column.name)
 		if err != nil {
@@ -790,6 +800,8 @@ func (db *DB) CompactAccountIDs(ctx context.Context) (map[int64]int64, error) {
 		{"account_links", "account_id"},
 		{"auth_key_accounts", "account_id"},
 		{"exclusive_account_owners", "account_id"},
+		{"account_links", "multi_primary_id"},
+		{"account_link_scans", "account_id"},
 	}
 	for oldID := range mapping {
 		// Fleets point at their primary by ID, so the pointer moves with it.
@@ -1185,6 +1197,10 @@ func (a *WechatAccount) Public() AccountPublic {
 		// GameAssist accounts keep their real WeChat openId, so the provider
 		// marker is the only channel signal.
 		product = "gameassist"
+	case stringCredential(a.Credentials, "provider") == "qbbrowser":
+		product = "qbbrowser"
+	case stringCredential(a.Credentials, "provider") == "ldplayer":
+		product = "ldplayer"
 	}
 	var refreshTokenObservedAt *int64
 	rescanRecommended := a.SessionOnly()
