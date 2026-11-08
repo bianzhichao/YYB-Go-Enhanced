@@ -1632,6 +1632,26 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 		// A request using the retained PSK cannot trigger OAuth or ManualAuth.
 		return nil, callErr
 	}
+	if protocol.ProviderOf(acc) == "ldplayer" {
+		var ticket *protocol.ManualAuthRejectedError
+		if errors.As(callErr, &ticket) && ticket.Code == -10 {
+			// There is no verified ticket reissue endpoint for LDPlayer. Do not
+			// replay a definitively rejected scan ticket on every script call.
+			status := "expired"
+			if a.pool.HasReusableSession(ctx, acc.ID, proxyValue) {
+				status = store.StatusSessionOnly
+			}
+			applied, err := a.db.ApplyCredentialRefresh(ctx, acc, "", nil, status)
+			if err != nil {
+				return nil, errors.Join(callErr, err)
+			}
+			if !applied {
+				return nil, store.ErrAccountAuthorizationChanged
+			}
+			a.notifyOffline(acc, status, callErr)
+			return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID, cause: callErr}
+		}
+	}
 	if op == eventlog.OpH5Code {
 		// An H5 authorization confirmation can issue a one-time code, so a
 		// failed request is never replayed after a forced refresh and never

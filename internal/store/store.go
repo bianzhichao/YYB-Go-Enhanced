@@ -6,14 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"yyb_go/internal/qbbrowser"
+
 	_ "modernc.org/sqlite"
 )
+
+var ErrQQBrowserBridgeDowngrade = errors.New("QQBrowser standalone authorization cannot be replaced by a browser token push")
 
 const schema = `
 CREATE TABLE IF NOT EXISTS wechat_accounts (
@@ -527,6 +532,9 @@ func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, ali
 	}
 	err = tx.QueryRowContext(ctx, "SELECT id, login_buffer, credentials FROM wechat_accounts WHERE openid=?", openid).Scan(&existingID, &existingBuffer, &existingCredentials)
 	if err == nil {
+		if qqBrowserBridgeDowngrade(existingCredentials, credJSON) {
+			return nil, ErrQQBrowserBridgeDowngrade
+		}
 		_, err = tx.ExecContext(ctx,
 			`UPDATE wechat_accounts SET `+accountOnlineIntervalSQL+`login_buffer=?, alias=?, nickname=?, avatar=?, user_info=?, credentials=?, status=?, updated_at=? WHERE id=?`,
 			append(onlineIntervalArgs(intervalStatus, "login", existingBuffer != loginBuffer || existingCredentials != credJSON, now),
@@ -1222,6 +1230,27 @@ func (a *WechatAccount) Public() AccountPublic {
 			credentialExpiresAtValue = refreshedAt + credentialExpiresIn
 		}
 	}
+	if product == "gameassist" && stringCredential(a.Credentials, "expiry_source") == "" && credentialExpiresIn == 30*86400 && credentialExpiresAtValue > 0 {
+		credentialExpiresAtValue = credentialExpiresAtValue - credentialExpiresIn + 7200
+		credentialExpiresIn = 7200
+	}
+	if product == "qbbrowser" {
+		var qb qbbrowser.Credentials
+		raw, _ := json.Marshal(a.Credentials["qbbrowser"])
+		_ = json.Unmarshal(raw, &qb)
+		// Native WXAuth has an upstream expiry; historical ctk-only imports
+		// do not. Neither has a verified 30-day authorization lifetime.
+		credentialExpiresAtValue, credentialExpiresIn = int64Credential(a.Credentials, "expires_at"), int64Credential(a.Credentials, "expires_in")
+		if !qb.CanRefresh() {
+			credentialExpiresAtValue, credentialExpiresIn = 0, 0
+		}
+		refreshTokenObservedAt, rescanRecommended = nil, a.SessionOnly()
+	}
+	if product == "ldplayer" {
+		// Previous versions stored fabricated one/seven-day placeholders.
+		credentialExpiresAtValue, credentialExpiresIn = 0, 0
+		refreshTokenObservedAt = nil
+	}
 	if credentialExpiresAtValue > 0 {
 		expiresAt := credentialExpiresAtValue
 		credentialExpiresAt = &expiresAt
@@ -1362,8 +1391,16 @@ func scanSession(row accountScanner) (*SessionRow, error) {
 	if uin.Valid {
 		s.UIN = &uin.Int64
 	}
-	if err := json.Unmarshal([]byte(blob), &s.SessionBlob); err != nil {
+	// Session identities are int64, often beyond float64's exact integer
+	// range. A rounded UIN makes every request after the fresh login carry a
+	// different identity. Keep the JSON number until protocol conversion.
+	decoder := json.NewDecoder(strings.NewReader(blob))
+	decoder.UseNumber()
+	if err := decoder.Decode(&s.SessionBlob); err != nil {
 		return nil, fmt.Errorf("decode session_blob: %w", err)
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return nil, fmt.Errorf("decode session_blob: trailing data")
 	}
 	s.blobJSON = blob
 	return &s, nil

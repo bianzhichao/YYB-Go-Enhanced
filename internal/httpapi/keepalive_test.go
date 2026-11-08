@@ -8,8 +8,84 @@ import (
 	"time"
 
 	"yyb_go/internal/protocol"
+	"yyb_go/internal/qbbrowser"
 	"yyb_go/internal/store"
 )
+
+func TestQQStandaloneBackgroundRefreshPersistsNativeTokens(t *testing.T) {
+	app := newKeepAliveTestApp(t)
+	defer app.Close()
+	ctx := context.Background()
+	acc := insertKeepAliveTestAccount(t, app, "qbbrowser:synthetic", time.Now().Add(time.Minute))
+	creds := protocol.CredentialsFromMap(acc.Credentials)
+	creds.Provider = "qbbrowser"
+	creds.QBBrowser = qbbrowser.Credentials{OpenID: "synthetic", QBAccessToken: creds.AccessToken, WXRefreshToken: creds.RefreshToken}
+	if err := app.db.SetAccountCredential(ctx, acc.ID, acc.LoginBuffer, creds.ToMap()); err != nil {
+		t.Fatal(err)
+	}
+	acc, _ = app.db.GetAccount(ctx, acc.ID)
+	calls := 0
+	app.refreshCredentials = func(_ context.Context, c protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
+		calls++
+		c.AccessToken = "new-access"
+		c.RefreshToken = "new-refresh"
+		c.QBBrowser.QBAccessToken = c.AccessToken
+		c.QBBrowser.WXRefreshToken = c.RefreshToken
+		c.ExpiresAt = time.Now().Add(2 * time.Hour).Unix()
+		c.ExpiresIn = 7200
+		c.ExpirySource = "upstream"
+		return c, nil
+	}
+	app.fetchLoginBuffer = func(context.Context, protocol.LoginBufferCredentials) (string, error) {
+		t.Fatal("QQ background refresh fetched a business ticket")
+		return "", nil
+	}
+	if status, renewed, err := app.refreshAccount(ctx, acc, false); err != nil || !renewed || status != "alive" {
+		t.Fatalf("QQ background refresh: %s %v %v", status, renewed, err)
+	}
+	saved, _ := app.db.GetAccount(ctx, acc.ID)
+	next := protocol.CredentialsFromMap(saved.Credentials)
+	if calls != 1 || next.QBBrowser.WXRefreshToken != "new-refresh" || next.QBBrowser.QBAccessToken != "new-access" || next.ExpiresIn != 7200 || saved.LoginBuffer != acc.LoginBuffer {
+		t.Fatal("native refresh result not persisted independently of ticket")
+	}
+	if _, renewed, err := app.refreshAccount(ctx, saved, false); err != nil || renewed || calls != 1 {
+		t.Fatal("fresh QQ credential repeatedly renewed")
+	}
+	next.ExpiresAt = 0
+	if credentialsDueForRefresh(next, time.Now(), time.Hour) {
+		t.Fatal("unknown QQ lifetime schedules speculative renewal")
+	}
+}
+
+func TestNonRenewableChannelsNeverRecordRenewal(t *testing.T) {
+	for _, provider := range []string{"qbbrowser", "ldplayer"} {
+		t.Run(provider, func(t *testing.T) {
+			app := newKeepAliveTestApp(t)
+			defer app.Close()
+			ctx := context.Background()
+			acc := insertKeepAliveTestAccount(t, app, "synthetic-"+provider, time.Now().Add(-time.Hour))
+			acc.Credentials["provider"] = provider
+			if err := app.db.SetAccountCredential(ctx, acc.ID, acc.LoginBuffer, acc.Credentials); err != nil {
+				t.Fatal(err)
+			}
+			acc, _ = app.db.GetAccount(ctx, acc.ID)
+			app.refreshCredentials = func(context.Context, protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
+				t.Fatal("unsupported renewal called")
+				return protocol.LoginBufferCredentials{}, nil
+			}
+			for _, force := range []bool{false, true} {
+				status, renewed, err := app.refreshAccount(ctx, acc, force)
+				if status != "alive" || renewed || force && !errors.Is(err, protocol.ErrCredentialRenewalUnsupported) || !force && err != nil {
+					t.Fatalf("force=%t status=%s renewed=%t err=%v", force, status, renewed, err)
+				}
+			}
+			got, _ := app.db.GetAccount(ctx, acc.ID)
+			if !got.SameAuthorization(acc) {
+				t.Fatal("unsupported renewal changed stored authorization")
+			}
+		})
+	}
+}
 
 func TestRefreshAccountRenewsDueCredentials(t *testing.T) {
 	app := newKeepAliveTestApp(t)

@@ -87,6 +87,9 @@ func (db *DB) UpsertAccountForAuthKey(ctx context.Context, enrollment ScanKeyEnr
 				return nil, err
 			}
 		}
+		if qqBrowserBridgeDowngrade(existingCredentials, credJSON) {
+			return nil, ErrQQBrowserBridgeDowngrade
+		}
 		_, err = tx.ExecContext(ctx,
 			`UPDATE wechat_accounts SET `+accountOnlineIntervalSQL+`login_buffer=?, alias=?, nickname=?, avatar=?, user_info=?, credentials=?, status=?, updated_at=? WHERE id=?`,
 			append(onlineIntervalArgs(intervalStatus, "login", existingBuffer != loginBuffer || existingCredentials != credJSON, now),

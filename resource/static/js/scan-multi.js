@@ -23,7 +23,7 @@
   const badgeImage = channel => {
     const image = document.createElement('img');
     image.alt = '';
-    image.src = `/static/images/scan-${channel.badge}.png`;
+    image.src = `/static/images/scan-${channel.badge}.png?v=093`;
     image.addEventListener('error', () => image.remove());
     return image;
   };

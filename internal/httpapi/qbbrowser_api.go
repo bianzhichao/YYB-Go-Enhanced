@@ -11,6 +11,7 @@ import (
 	"yyb_go/internal/eventlog"
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/qbbrowser"
+	"yyb_go/internal/store"
 )
 
 // QQ Browser token push: the companion extension (extensions/qbbrowser-token)
@@ -22,8 +23,10 @@ import (
 type qbTokenPush struct {
 	AccessToken string `json:"access_token"`
 	UserID      string `json:"user_id"`
+	OpenID      string `json:"openid"`
 	GUID        string `json:"guid"`
 	Nickname    string `json:"nickname"`
+	QBRNCookie  string `json:"qbrn_cookie"`
 }
 
 func (a *App) handleQBBrowserToken(w http.ResponseWriter, r *http.Request) {
@@ -39,8 +42,10 @@ func (a *App) handleQBBrowserToken(w http.ResponseWriter, r *http.Request) {
 	creds := qbbrowser.Credentials{
 		QBAccessToken: strings.TrimSpace(body.AccessToken),
 		UserID:        strings.TrimSpace(body.UserID),
+		OpenID:        strings.TrimSpace(body.OpenID),
 		GUID:          strings.TrimSpace(body.GUID),
 		Nickname:      strings.TrimSpace(body.Nickname),
+		QBRNCookie:    strings.TrimSpace(body.QBRNCookie),
 	}
 	if err := creds.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -85,12 +90,14 @@ func (a *App) handleQBBrowserToken(w http.ResponseWriter, r *http.Request) {
 		Provider: "qbbrowser", OpenID: openID,
 		QBBrowser:              creds,
 		LoginType:              "WX",
-		ExpiresAt:              time.Now().Unix() + 86400,
-		ExpiresIn:              86400,
 		RefreshTokenObservedAt: time.Now().Unix(),
 	}.ToMap()
 	acc, err := a.saveScannedAccount(ctx, openID, buffer, nil, nil, nil, nil, credMap, &status)
 	if err != nil {
+		if errors.Is(err, store.ErrQQBrowserBridgeDowngrade) {
+			writeError(w, http.StatusConflict, "此 QQ 账号已由独立扫码管理，请停用扩展推送，使用扫码页更新授权")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
 		return
 	}
