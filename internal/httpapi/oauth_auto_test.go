@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"yyb_go/internal/oauth"
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/store"
 )
@@ -156,5 +157,31 @@ func TestPublicOAuthMergeProxyOverride(t *testing.T) {
 	app.handlePublicOAuth(out, req)
 	if out.Code != 200 || calls != 1 {
 		t.Fatalf("status=%d calls=%d body=%s", out.Code, calls, out.Body.String())
+	}
+}
+
+func TestPublicOAuthAutoForwardsComponentAppID(t *testing.T) {
+	app := newKeepAliveTestApp(t)
+	defer app.Close()
+	acc := insertKeepAliveTestAccount(t, app, "oauth-component", time.Now().Add(time.Hour))
+	calls := 0
+	app.oauthH5Invoke = func(_ context.Context, _ *store.WechatAccount, appID string, payload map[string]any, _ string, _ bool) (map[string]any, error) {
+		calls++
+		request := h5CodeParams(payload)
+		request.AppID = appID
+		if request.ComponentAppID != "wx0000000000000001" {
+			t.Fatal("component_appid lost before building the protocol request")
+		}
+		auth, err := oauth.Build(request)
+		if err != nil || !strings.Contains(auth.FullURL, "component_appid=wx0000000000000001") {
+			t.Fatal("component_appid lost from authorization URL", err)
+		}
+		return map[string]any{"code": "synthetic-h5", "scope": auth.Scope, "state": auth.State}, nil
+	}
+	out := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wx/oauth", strings.NewReader(fmt.Sprintf(`{"ref":"%d","appid":"wx1234567890abcdef","redirect_uri":"https://example.com/login","component_appid":"wx0000000000000001"}`, acc.ID)))
+	app.handlePublicOAuth(out, req)
+	if out.Code != http.StatusOK || calls != 1 || !strings.Contains(out.Body.String(), "component_appid=wx0000000000000001") {
+		t.Fatalf("component request was not forwarded once: %d/%d %s", out.Code, calls, out.Body.String())
 	}
 }

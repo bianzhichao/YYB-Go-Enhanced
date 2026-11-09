@@ -147,14 +147,13 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	return p
 }
 
-// ProviderOf returns the credential provider marker of an account. Appstore
-// accounts store none; pcmgr and gameassist carry their channel name.
+// ProviderOf keeps routing consistent with the saved channel identity, including
+// historical namespaced records whose credentials were wiped. YYB uses "".
 func ProviderOf(acc *store.WechatAccount) string {
-	if acc == nil {
+	if acc == nil || acc.ScanProduct() == "appstore" {
 		return ""
 	}
-	provider, _ := acc.Credentials["provider"].(string)
-	return provider
+	return acc.ScanProduct()
 }
 
 func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
@@ -263,6 +262,16 @@ func (p *Pool) Invalidate(ctx context.Context, accountID int64, tcpProxy string)
 	return p.db.InvalidateSession(ctx, accountID, requestSessionKey(ctx, tcpProxy))
 }
 
+// PrepareSession consumes a newly confirmed scan ticket while it is fresh and
+// persists the protocol state. It requests no application code and makes no
+// claim about the server accepting future business calls or long-term renewal.
+func (p *Pool) PrepareSession(ctx context.Context, acc *store.WechatAccount, proxy string, fallback bool) error {
+	_, err := p.run(ctx, acc.LoginBuffer, acc.ID, proxy, fallback, func(context.Context, WmpfSession) (map[string]any, error) {
+		return nil, nil
+	}, acc)
+	return err
+}
+
 func (p *Pool) invalidateExpected(ctx context.Context, accountID int64, proxy string, expected ...*store.WechatAccount) error {
 	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, requestSessionKey(ctx, proxy)))
 	if err := acquire(ctx, lock); err != nil {
@@ -299,7 +308,7 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	if err == nil {
 		st.FallbackDirect = fallbackDirect
 		res, err := op(ctx, st)
-		if err == nil || tcpProxy == "" || !fallbackDirect || IsApplicationRequestRejection(err) || IsNoRetry(err) || st.CachedOnly {
+		if err == nil || tcpProxy == "" || !fallbackDirect || IsApplicationRequestRejection(err) || IsBusinessResponseRejection(err) || errors.Is(err, ErrLoginCodeMalformed) || IsNoRetry(err) || st.CachedOnly {
 			return res, err
 		}
 		_ = p.invalidateExpected(ctx, accountID, tcpProxy, expected...)
@@ -574,6 +583,10 @@ func (p *Pool) loginTarget(ctx context.Context, target Target, loginBuffer, tcpP
 }
 
 func (p *Pool) sendEnvelope(ctx context.Context, st WmpfSession, envelope []byte) ([]byte, []byte, error) {
+	return p.sendEnvelopeWithReplay(ctx, st, envelope, true)
+}
+
+func (p *Pool) sendEnvelopeWithReplay(ctx context.Context, st WmpfSession, envelope []byte, allowReplay bool) ([]byte, []byte, error) {
 	if err := acquire(ctx, p.shortlinkSem); err != nil {
 		return nil, nil, err
 	}
@@ -581,7 +594,7 @@ func (p *Pool) sendEnvelope(ctx context.Context, st WmpfSession, envelope []byte
 	reqCtx, cancel := context.WithTimeout(ctx, p.cfg.ShortlinkTimeout)
 	defer cancel()
 	proxy, fallback := requestBusinessProxy(ctx, st.TCPProxy, st.FallbackDirect)
-	return send0RTT(reqCtx, st.ShortlinkTargets, st.PSK, st.Session.RecvKey, envelope, p.cfg.ShortlinkTimeout, proxy, fallback)
+	return send0RTT(reqCtx, st.ShortlinkTargets, st.PSK, st.Session.RecvKey, envelope, p.cfg.ShortlinkTimeout, proxy, fallback, allowReplay)
 }
 
 func acquire(ctx context.Context, sem chan struct{}) error {

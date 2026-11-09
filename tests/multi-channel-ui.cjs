@@ -24,6 +24,13 @@ async function fresh(browser) {
   const context = await browser.newContext({viewport: {width: 1280, height: 1000}});
   const login = await context.request.post(base + '/login', {data: {username: process.env.YYB_TEST_USER, password: process.env.YYB_TEST_PASS}});
   assert.equal((await login.json()).code, 0);
+  // These legacy grouping fixtures cover three providers; registry expansion
+  // and QQ/LD identity consent are covered by account-link-multi-ui.cjs.
+  await context.route('**/api/scan-channels', async route => {
+    const data = await (await context.request.get(base+'/api/scan-channels')).json();
+    data.data.channels = data.data.channels.filter(channel => ['appstore','pcmgr','gameassist'].includes(channel.id));
+    return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
+  });
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -125,7 +132,7 @@ async function resetFleets(browser) {
       const {context, page, errors} = await fresh(browser);
       const S = await seeded(context);
       const [appstore, pcmgr, gameassist] = S.alice;
-      const channels = (await (await context.request.get(base + '/api/scan-channels')).json()).data.channels;
+      const channels = (await (await context.request.get(base + '/api/scan-channels')).json()).data.channels.filter(c => ['appstore','pcmgr','gameassist'].includes(c.id));
       assert(channels.length >= 3);
       const ids = channels.map(channel => channel.id);
       const qr = await mockQR(context, await withAccounts(context, [['appstore', appstore], ['pcmgr', pcmgr], ['gameassist', gameassist]]));
@@ -279,7 +286,7 @@ async function resetFleets(browser) {
       await context.close();
     }
 
-    // Adding channels to an account that already has some: only the missing ones get a QR.
+    // Existing-account supplementation now creates one root-anchored update link.
     {
       const {context, page, errors} = await fresh(browser);
       const S = await seeded(context);
@@ -334,6 +341,21 @@ async function resetFleets(browser) {
       assert.equal([...qr.sessions.values()].filter(session => session.live).length, 0, 'every channel session is cancelled on leaving');
       assert.deepEqual(errors, []);
       await dissolve(context, appstore);
+      await context.close();
+    }
+    {
+      const {context, page, errors} = await fresh(browser);
+      const S = await seeded(context);
+      const [updateApp, updateMember] = S.boom;
+      let requested;
+      await context.route('**/api/account-links',route=>{requested=route.request().postDataJSON();return route.fulfill(json({url:base+'/account-link/synthetic-update'}));});
+      await context.route('**/account-link/synthetic-update',route=>route.fulfill({status:200,contentType:'text/html',body:'<p>更新链接</p>'}));
+      const qr = await mockQR(context, {});
+      await page.goto(base+'/scan?ref='+updateMember);
+      await page.waitForURL(base+'/account-link/synthetic-update');
+      assert.deepEqual(requested,{kind:'update',ref:String(updateApp),allow_multi_channel:true});
+      assert.equal(qr.requested.length,0);
+      assert.deepEqual(errors, []);
       await context.close();
     }
 

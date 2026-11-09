@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS account_circuit_settings (
+    account_id INTEGER PRIMARY KEY REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+);
+
 CREATE TABLE IF NOT EXISTS account_links (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     token_hash      TEXT    NOT NULL UNIQUE,
@@ -805,6 +810,7 @@ func (db *DB) CompactAccountIDs(ctx context.Context) (map[int64]int64, error) {
 		{"account_script_jobs", "account_id"},
 		{"account_push_settings", "account_id"},
 		{"account_proxy_settings", "account_id"},
+		{"account_circuit_settings", "account_id"},
 		{"account_links", "account_id"},
 		{"auth_key_accounts", "account_id"},
 		{"exclusive_account_owners", "account_id"},
@@ -976,8 +982,7 @@ WHERE id=? AND openid=? AND credentials IS ? AND login_buffer=? AND status IS ?`
 func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) error {
 	now := time.Now().Unix()
 	if status == "expired" {
-		// Expiry wipes the credentials but keeps the channel marker, which for a
-		// GameAssist account is the only thing that says what it is.
+		// Expiry wipes secrets but keeps the non-secret channel identity.
 		var raw sql.NullString
 		if err := db.sql.QueryRowContext(ctx, "SELECT credentials FROM wechat_accounts WHERE id=?", id).Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -1194,22 +1199,27 @@ func (db *DB) GetFeatureByName(ctx context.Context, name string) (*Feature, erro
 	return &f, nil
 }
 
-func (a *WechatAccount) Public() AccountPublic {
-	product := "appstore"
-	switch {
-	case strings.HasPrefix(a.OpenID, "pcmgr:"):
-		product = "pcmgr"
-	case stringCredential(a.Credentials, "provider") == "pcmgr":
-		product = "pcmgr"
-	case stringCredential(a.Credentials, "provider") == "gameassist":
-		// GameAssist accounts keep their real WeChat openId, so the provider
-		// marker is the only channel signal.
-		product = "gameassist"
-	case stringCredential(a.Credentials, "provider") == "qbbrowser":
-		product = "qbbrowser"
-	case stringCredential(a.Credentials, "provider") == "ldplayer":
-		product = "ldplayer"
+// ScanProduct identifies the channel even for historical records whose secrets
+// and provider marker were wiped. Only explicit identity namespaces can recover
+// a missing marker; native OpenIDs alone cannot distinguish GameAssist from YYB.
+func (a *WechatAccount) ScanProduct() string {
+	if a == nil {
+		return "appstore"
 	}
+	for _, provider := range []string{"pcmgr", "qbbrowser", "ldplayer"} {
+		if strings.HasPrefix(a.OpenID, provider+":") {
+			return provider
+		}
+	}
+	switch provider := stringCredential(a.Credentials, "provider"); provider {
+	case "pcmgr", "gameassist", "qbbrowser", "ldplayer":
+		return provider
+	}
+	return "appstore"
+}
+
+func (a *WechatAccount) Public() AccountPublic {
+	product := a.ScanProduct()
 	var refreshTokenObservedAt *int64
 	rescanRecommended := a.SessionOnly()
 	var credentialExpiresAt *int64
@@ -1290,17 +1300,12 @@ func stringCredential(values map[string]any, key string) string {
 	return value
 }
 
-// keepChannelMarkers returns what survives when an account's credentials are
-// wiped because the authorization was rejected: the marker that says which
-// channel the account belongs to, and nothing secret. A GameAssist account keeps
-// its real WeChat openId, so its provider marker is the only thing telling it
-// apart from an App Store account; losing it relabelled the account as YYB in
-// the console, in the events and in the offline notice. PCMgr accounts are told
-// apart by their "pcmgr:" openId prefix and App Store accounts carry no marker,
-// so only GameAssist needs this.
+// keepChannelMarkers retains only a known, non-secret provider marker when a
+// rejected authorization is wiped. Channel identity must outlive its secrets.
 func keepChannelMarkers(credentials map[string]any) map[string]any {
-	if stringCredential(credentials, "provider") == "gameassist" {
-		return map[string]any{"provider": "gameassist"}
+	switch provider := stringCredential(credentials, "provider"); provider {
+	case "pcmgr", "gameassist", "qbbrowser", "ldplayer":
+		return map[string]any{"provider": provider}
 	}
 	return nil
 }

@@ -50,6 +50,8 @@ var catalog = map[string]definition{
 	"keepalive.renewed":          {"keepalive", "info", "后台凭据续期完成"},
 	"account.expired":            {"account", "warn", "账号授权失效，需重新扫码"},
 	"account.scanned":            {"account", "info", "扫码授权已保存"},
+	"account.session_prepared":   {"account", "info", "扫码协议会话已建立并保存，长期恢复仍待验证"},
+	"account.session_failed":     {"account", "error", "扫码授权已保存，但协议会话建立失败"},
 	"account.refreshed":          {"account", "info", "凭据已按需或手动刷新"},
 	"account.refresh_failed":     {"account", "warn", "凭据按需或手动刷新失败"},
 	"account.notified":           {"account", "info", "已推送掉线提醒"},
@@ -71,18 +73,19 @@ const (
 )
 
 type Fields struct {
-	AccountID  int64       `json:"-"`
-	Channel    string      `json:"-"`
-	Route      string      `json:"route,omitempty"`
-	Method     string      `json:"method,omitempty"`
-	Status     int         `json:"http_status,omitempty"`
-	DurationMS int64       `json:"duration_ms,omitempty"`
-	AppID      string      `json:"app_id,omitempty"`
-	Operation  string      `json:"operation,omitempty"`
-	API        string      `json:"api,omitempty"`
-	Source     string      `json:"source,omitempty"`
-	Rejections []Rejection `json:"rejections,omitempty"`
-	Count      uint64      `json:"count,omitempty"`
+	AccountID     int64       `json:"-"`
+	Channel       string      `json:"-"`
+	Route         string      `json:"route,omitempty"`
+	Method        string      `json:"method,omitempty"`
+	Status        int         `json:"http_status,omitempty"`
+	DurationMS    int64       `json:"duration_ms,omitempty"`
+	AppID         string      `json:"app_id,omitempty"`
+	Operation     string      `json:"operation,omitempty"`
+	API           string      `json:"api,omitempty"`
+	Source        string      `json:"source,omitempty"`
+	Rejections    []Rejection `json:"rejections,omitempty"`
+	ResponseStage string      `json:"response_stage,omitempty"`
+	Count         uint64      `json:"count,omitempty"`
 	// Waited and Refused summarise a burst that pacing queued or turned away.
 	Waited  uint64 `json:"waited,omitempty"`
 	Refused uint64 `json:"refused,omitempty"`
@@ -132,8 +135,7 @@ func ForAccount(acc *store.WechatAccount) Fields {
 	if acc == nil {
 		return Fields{}
 	}
-	provider, _ := acc.Credentials["provider"].(string)
-	return Fields{AccountID: acc.ID, Channel: ChannelFor(provider)}
+	return Fields{AccountID: acc.ID, Channel: ChannelFor(acc.ScanProduct())}
 }
 
 // Routes are router templates, never the requested URL or account-link token.
@@ -160,7 +162,7 @@ func safeOperation(op string) bool {
 
 func safeStage(stage string) bool {
 	switch stage {
-	case "refresh_token", "check_login", "login_buffer", "manual_auth", "native_autoauth_transport", "native_autoauth_application", "native_autoauth_business", "shortlink_transport", "shortlink_application", "pcmgr_login_buffer", "pcmgr_key_renewal", "circuit_target", "circuit_session":
+	case "refresh_token", "check_login", "login_buffer", "manual_auth", "native_autoauth_transport", "native_autoauth_application", "native_autoauth_business", "shortlink_transport", "shortlink_application", "jslogin_business", "jslogin_result", "h5_oauth_business", "pcmgr_login_buffer", "pcmgr_key_renewal", "circuit_target", "circuit_session":
 		return true
 	}
 	return false
@@ -196,7 +198,7 @@ func (l *Logger) Emit(event string, f Fields) {
 	if f.AccountID < 0 {
 		f.AccountID = 0
 	}
-	if f.Channel != "yyb" && f.Channel != "pcmgr" && f.Channel != "gameassist" {
+	if f.Channel != "yyb" && f.Channel != "pcmgr" && f.Channel != "gameassist" && f.Channel != "qbbrowser" && f.Channel != "ldplayer" {
 		f.Channel = ""
 	}
 	if !safeRoute.MatchString(f.Route) {
@@ -212,6 +214,11 @@ func (l *Logger) Emit(event string, f Fields) {
 	}
 	if !safeOperation(f.Operation) {
 		f.Operation = ""
+	}
+	switch f.ResponseStage {
+	case "mmtls_records", "mmtls_decrypt", "session_payload":
+	default:
+		f.ResponseStage = ""
 	}
 	if !safeAPIName.MatchString(f.API) {
 		f.API = ""

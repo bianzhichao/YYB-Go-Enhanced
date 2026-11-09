@@ -3,9 +3,9 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
-	"time"
 
 	"yyb_go/internal/eventlog"
 	"yyb_go/internal/pcmgr"
@@ -42,8 +42,11 @@ func fleetFailover(err error) bool {
 	if err == nil || protocol.IsNoRetry(err) {
 		return false
 	}
-	var h5Rejected *protocol.ErrH5OAuthBusinessRejected
-	if errors.As(err, &h5Rejected) {
+	var h5Attempt *protocol.H5AuthorizationAttemptError
+	if errors.As(err, &h5Attempt) {
+		return false
+	}
+	if protocol.IsBusinessResponseRejection(err) {
 		// The upstream judged the request itself (appid/redirect pairing,
 		// scope...). Every member would receive the same verdict.
 		return false
@@ -94,6 +97,9 @@ func fleetFailover(err error) bool {
 // machinery; the caller's `call` stays identical for each member.
 func (a *App) invokeWithFleet(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
 	primary := fleetPrimaryOf(acc)
+	if primary > 0 && primary != acc.ID {
+		return nil, &fleetMemberReferenceError{PrimaryID: primary}
+	}
 	if primary <= 0 {
 		return a.invokeWXApp(ctx, acc, appID, payload, call)
 	}
@@ -144,6 +150,12 @@ func (a *App) invokeWithFleet(ctx context.Context, acc *store.WechatAccount, app
 
 type fleetRequestContext struct{}
 
+type fleetMemberReferenceError struct{ PrimaryID int64 }
+
+func (e *fleetMemberReferenceError) Error() string {
+	return fmt.Sprintf("channel member cannot be called directly; use primary account ref=%d", e.PrimaryID)
+}
+
 func fleetPrimaryOf(acc *store.WechatAccount) int64 {
 	if acc == nil || acc.FleetPrimaryID == nil {
 		return 0
@@ -157,7 +169,8 @@ func (a *App) fleetMarkUsed(id int64) {
 	if a.fleetLast == nil {
 		a.fleetLast = map[int64]int64{}
 	}
-	a.fleetLast[id] = time.Now().UnixNano()
+	a.fleetSequence++
+	a.fleetLast[id] = a.fleetSequence
 }
 func (a *App) fleetLastUsed(id int64) int64 {
 	a.fleetMu.Lock()
